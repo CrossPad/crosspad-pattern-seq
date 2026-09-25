@@ -1,0 +1,17 @@
+{
+  "name": "Sequencer",
+  "id": "sequencer",
+  "version": "0.1.0",
+  "description": "Record, loop and erase scenes on the pads",
+  "category": "music",
+  "icon": "sequencer.png",
+  "component_path": "components/crosspad-sequencer",
+  "platforms": ["esp-idf", "pc"],
+  "requires": {
+    "crosspad-core": ">=0.3.0",
+    "crosspad-gui": ">=0.2.0"
+  },
+  "changelog": [
+    "0.1.0: Generated from the CrossPad app template"
+  ]
+}
