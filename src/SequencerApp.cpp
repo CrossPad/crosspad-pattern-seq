@@ -29,6 +29,8 @@
 #endif
 
 #include "crosspad/app/AppRegistrar.hpp"
+#include "crosspad/event/EventData.hpp"
+#include "crosspad/event/IEventBus.hpp"
 #include "crosspad/kit/IKitManager.hpp"
 #include "crosspad/kit/KitInfo.hpp"
 #include "crosspad/platform/PlatformServices.hpp"
@@ -39,6 +41,7 @@
 
 #include "lvgl.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -73,6 +76,8 @@ const lv_color_t kRec    = lv_color_hex(0xFF5C5C);
 const lv_color_t kPlay   = lv_color_hex(0x4FE0B0);
 const lv_color_t kAmber  = lv_color_hex(0xFFC857);
 const lv_color_t kHead   = lv_color_hex(0xFFFFFF);
+/// The tempo field while a host's MIDI clock drives the tempo.
+const lv_color_t kHostClock = lv_color_hex(0x4FC3F7);
 
 lv_obj_t* s_root = nullptr;
 lv_obj_t* s_grid = nullptr;
@@ -90,6 +95,10 @@ lv_obj_t* s_playBtn = nullptr;
 lv_obj_t* s_stopBtn = nullptr;
 lv_timer_t* s_timer = nullptr;
 bool s_bpmSyncing = false;   // a sync must not read back as an edit
+/* Subscribed on the first open and kept: the clock publishes only changes, so
+ * a screen opened while the host already drives must find the flag current. */
+crosspad::SubscriptionHandle s_tempoSub = nullptr;
+std::atomic<bool> s_tempoFromHost{false};
 
 /* The bounce window: track picker, then progress, then the result. */
 lv_obj_t* s_bounceBox = nullptr;
@@ -316,6 +325,10 @@ void sync_ui()
             lv_spinbox_set_value(s_bpm, shown);
             s_bpmSyncing = false;
         }
+        const lv_color_t field = s_tempoFromHost.load(std::memory_order_relaxed) ? kHostClock : kPanel;
+        if (!lv_color_eq(lv_obj_get_style_bg_color(s_bpm, 0), field)) {
+            lv_obj_set_style_bg_color(s_bpm, field, 0);
+        }
     }
 }
 
@@ -356,7 +369,16 @@ void bpm_cb(lv_event_t* e)
     /* No set_cursor_pos()/set_step() here: both rewrite the text, which sends
      * VALUE_CHANGED straight back into this handler. The cursor is pinned on
      * focus and click instead. */
-    const int32_t v = lv_spinbox_get_value(static_cast<lv_obj_t*>(lv_event_get_target(e)));
+    auto* field = static_cast<lv_obj_t*>(lv_event_get_target(e));
+    if (s_tempoFromHost.load(std::memory_order_relaxed)) {
+        /* The DAW's clock owns the tempo: put the field back and touch neither
+         * the kit nor sequences.json. */
+        s_bpmSyncing = true;
+        lv_spinbox_set_value(field, (int32_t)lroundf(sq->getBpm()));
+        s_bpmSyncing = false;
+        return;
+    }
+    const int32_t v = lv_spinbox_get_value(field);
     if ((int32_t)lroundf(sq->getBpm()) == v) return;
     sq->setBpm((float)v);
     if (auto* kit = current_kit()) kit->bpm = (uint16_t)v;
@@ -711,6 +733,16 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
     lv_obj_t* top = make_row(s_root, 22);
     make_button(top, 30, 22, LV_SYMBOL_LEFT, back_cb, app);
     s_bpm = make_bpm(top);
+    if (!s_tempoSub) {
+        /* Event-bus task: only remember who drives the tempo; sync_ui() on
+         * the LVGL timer shows it. */
+        s_tempoSub = crosspad::getEventBus().subscribe(crosspad::EventType::TempoChanged,
+            [](const void* data, crosspad::EventType, void*) {
+                const auto* d = static_cast<const crosspad::TempoChangedData*>(data);
+                s_tempoFromHost.store(d->source == crosspad::EventSource::MidiInput,
+                                      std::memory_order_relaxed);
+            }, nullptr);
+    }
     s_clickBtn = make_button(top, 26, 22, "M", click_cb);
     s_preBtn = make_button(top, 30, 22, "PRE", pre_cb);
     lv_obj_t* barsBtn = make_button(top, 30, 22, "4b", bars_cb);

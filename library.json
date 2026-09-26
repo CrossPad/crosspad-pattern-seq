@@ -1,6 +1,6 @@
 {
     "name": "crosspad-sequencer",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "Record, loop and erase scenes on the pads",
     "keywords": ["crosspad", "sequencer", "lvgl", "pad"],
     "dependencies": {

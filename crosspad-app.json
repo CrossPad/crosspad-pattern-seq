@@ -1,17 +1,21 @@
 {
   "name": "Sequencer",
   "id": "sequencer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Record, loop and erase scenes on the pads",
   "category": "music",
   "icon": "sequencer.png",
   "component_path": "components/crosspad-sequencer",
-  "platforms": ["esp-idf", "pc"],
+  "platforms": [
+    "esp-idf",
+    "pc"
+  ],
   "requires": {
-    "crosspad-core": ">=0.3.0",
-    "crosspad-gui": ">=0.2.0"
+    "crosspad-core": ">=1.21.0",
+    "crosspad-gui": ">=1.12.0"
   },
   "changelog": [
+    "0.2.0: tempo field follows a host's MIDI clock and refuses edits while it drives (from the Sampler, ae3dc82); count-in is one bar of the metre; requires core 1.21 and gui 1.12",
     "0.1.0: Generated from the CrossPad app template"
   ]
 }

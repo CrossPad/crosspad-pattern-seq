@@ -8,8 +8,7 @@ Generated from the [CrossPad app template](https://github.com/CrossPad/crosspad-
 
 | Path | Purpose |
 |------|---------|
-| `src/SequencerApp.cpp` | UI, animation timer, LVGL buttons + slider, `REGISTER_APP_PL` |
-| `src/SequencerPadLogic.cpp` | Pad handler — records events for the GUI thread |
+| `src/SequencerApp.cpp` | The loop recorder: tempo (blue and locked while a host's MIDI clock drives it), click, count-in, bars, grid, x2 / 2, held erase, scenes, transport, and BOUNCE to the song; `REGISTER_APP` (no pad logic — the pads stay the Sampler's) |
 | `CMakeLists.txt` | ESP-IDF component; the PC simulator globs `src/` itself |
 | `crosspad-app.json` | Registry metadata (name, id, platforms, requirements) |
 
