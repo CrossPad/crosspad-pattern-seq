@@ -361,7 +361,7 @@ void back_cb(lv_event_t* e)
 
 /// The tempo goes to the clock at once -- the pattern is rescaled with it, so
 /// a take keeps its place in the bar -- and sequences.json carries it with
-/// the scenes, which is what a kit loads its tempo back from.
+/// the scenes. It is the groove's, not the kit's: another kit plays it as is.
 void bpm_cb(lv_event_t* e)
 {
     auto* sq = seq();
@@ -371,8 +371,8 @@ void bpm_cb(lv_event_t* e)
      * focus and click instead. */
     auto* field = static_cast<lv_obj_t*>(lv_event_get_target(e));
     if (s_tempoFromHost.load(std::memory_order_relaxed)) {
-        /* The DAW's clock owns the tempo: put the field back and touch neither
-         * the kit nor sequences.json. */
+        /* The DAW's clock owns the tempo: put the field back and leave
+         * sequences.json alone. */
         s_bpmSyncing = true;
         lv_spinbox_set_value(field, (int32_t)lroundf(sq->getBpm()));
         s_bpmSyncing = false;
@@ -381,7 +381,6 @@ void bpm_cb(lv_event_t* e)
     const int32_t v = lv_spinbox_get_value(field);
     if ((int32_t)lroundf(sq->getBpm()) == v) return;
     sq->setBpm((float)v);
-    if (auto* kit = current_kit()) kit->bpm = (uint16_t)v;
 }
 
 /// A bar of click before a take started from a stop, so the first hit lands
