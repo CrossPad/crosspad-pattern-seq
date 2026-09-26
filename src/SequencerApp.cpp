@@ -37,10 +37,10 @@
 #include "crosspad/sequencer/SequencerController.hpp"
 #include "crosspad/song/ISongEngine.hpp"
 #include "crosspad-gui/widgets/gui_helpers.h"
-#include "crosspad-gui/widgets/spinbox_helpers.h"
 
 #include "lvgl.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -82,6 +82,7 @@ const lv_color_t kHostClock = lv_color_hex(0x4FC3F7);
 lv_obj_t* s_root = nullptr;
 lv_obj_t* s_grid = nullptr;
 lv_obj_t* s_bpm = nullptr;
+lv_obj_t* s_syncBtn = nullptr;
 lv_obj_t* s_clickBtn = nullptr;
 lv_obj_t* s_preBtn = nullptr;
 lv_obj_t* s_barsLabel = nullptr;
@@ -94,7 +95,6 @@ lv_obj_t* s_dubBtn = nullptr;
 lv_obj_t* s_playBtn = nullptr;
 lv_obj_t* s_stopBtn = nullptr;
 lv_timer_t* s_timer = nullptr;
-bool s_bpmSyncing = false;   // a sync must not read back as an edit
 /* Subscribed on the first open and kept: the clock publishes only changes, so
  * a screen opened while the host already drives must find the flag current. */
 crosspad::SubscriptionHandle s_tempoSub = nullptr;
@@ -177,12 +177,14 @@ void grid_draw_cb(lv_event_t* e)
     crosspad::KitInfo* kit = current_kit();
 
     /* Lanes: the pad's own colour as a strip at the left edge, so a note's
-     * colour can be matched to its row without a label. */
+     * colour can be matched to its row without a label. Pad 1 at the bottom,
+     * the way the pads sit under your hand. */
+    auto laneY = [&](int pad) { return box.y1 + (kLanes - 1 - pad) * laneH; };
     for (int p = 0; p < kLanes; ++p) {
-        const int32_t y = box.y1 + p * laneH;
+        const int32_t y = laneY(p);
         const lv_color_t pc = kit ? lv_color_hex(kit->pads[p].color) : kDim;
         fill(layer, box.x1, y, box.x1 + 2, y + laneH - 2, pc, LV_OPA_COVER);
-        if (p % 4 == 3 && p < kLanes - 1) {
+        if (p % 4 == 0 && p > 0) {      // under a row of four: the line to the row below
             fill(layer, x0, y + laneH - 1, x0 + gw - 1, y + laneH - 1, kLine, LV_OPA_COVER);
         }
     }
@@ -200,7 +202,7 @@ void grid_draw_cb(lv_event_t* e)
         uint8_t pad = 0, vel = 0;
         if (!sq->getSceneEvent(scene, i, at, pad, vel) || pad >= kLanes) continue;
         const int32_t x = x0 + (int32_t)(at * gw);
-        const int32_t y = box.y1 + pad * laneH;
+        const int32_t y = laneY(pad);
         const lv_color_t pc = kit ? lv_color_hex(kit->pads[pad].color) : kAccent;
         const lv_opa_t opa = (lv_opa_t)(110 + (vel > 127 ? 127 : vel) * 145 / 127);
         fill(layer, x, y, x + noteW - 1, y + laneH - 2, pc, opa);
@@ -286,6 +288,14 @@ void sync_ui()
     paint(s_playBtn, (run && !rec && !dub) ? kPlay : kPanel, run && !rec && !dub);
     paint(s_stopBtn, kPanel, false);
     paint(s_clickBtn, sq->getClickActive() ? kAmber : kPanel, sq->getClickActive());
+    if (auto* se = crosspad::getPlatformServices().songEngine) {
+        bool sync = false;
+        {
+            std::lock_guard<std::recursive_mutex> l(se->songMutex());
+            sync = se->song().syncSeq;
+        }
+        paint(s_syncBtn, sync ? kAccent : kPanel, sync);
+    }
     if (!sq->isErasing()) paint(s_eraseBtn, kPanel, false);
 
     const bool off = sq->getQuantization() == crosspad::Quantization::Off;
@@ -318,13 +328,10 @@ void sync_ui()
         lv_obj_set_style_text_color(s_sceneLabel, sceneInk, 0);
     }
 
-    if (s_bpm && !lv_obj_has_state(s_bpm, LV_STATE_EDITED)) {
-        const int32_t shown = (int32_t)lroundf(sq->getBpm());
-        if (lv_spinbox_get_value(s_bpm) != shown) {
-            s_bpmSyncing = true;
-            lv_spinbox_set_value(s_bpm, shown);
-            s_bpmSyncing = false;
-        }
+    if (s_bpm) {
+        std::snprintf(buf, sizeof(buf), "%03d", (int)lroundf(sq->getBpm()));
+        set_text(lv_obj_get_child(s_bpm, 0), buf);
+        /* Blue while a host's MIDI clock drives the tempo. */
         const lv_color_t field = s_tempoFromHost.load(std::memory_order_relaxed) ? kHostClock : kPanel;
         if (!lv_color_eq(lv_obj_get_style_bg_color(s_bpm, 0), field)) {
             lv_obj_set_style_bg_color(s_bpm, field, 0);
@@ -365,22 +372,28 @@ void back_cb(lv_event_t* e)
 void bpm_cb(lv_event_t* e)
 {
     auto* sq = seq();
-    if (!sq || s_bpmSyncing) return;
-    /* No set_cursor_pos()/set_step() here: both rewrite the text, which sends
-     * VALUE_CHANGED straight back into this handler. The cursor is pinned on
-     * focus and click instead. */
-    auto* field = static_cast<lv_obj_t*>(lv_event_get_target(e));
-    if (s_tempoFromHost.load(std::memory_order_relaxed)) {
-        /* The DAW's clock owns the tempo: put the field back and leave
-         * sequences.json alone. */
-        s_bpmSyncing = true;
-        lv_spinbox_set_value(field, (int32_t)lroundf(sq->getBpm()));
-        s_bpmSyncing = false;
+    lv_obj_t* b = static_cast<lv_obj_t*>(lv_event_get_current_target(e));
+    if (!sq || !b) return;
+    lv_group_t* g = lv_obj_get_group(b);
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        /* The encoder's second click, or a tap: leave edit mode, or enter it. */
+        if (g) {
+            const bool editing = lv_group_get_editing(g) && lv_group_get_focused(g) == b;
+            lv_group_focus_obj(b);
+            lv_group_set_editing(g, !editing);
+        }
         return;
     }
-    const int32_t v = lv_spinbox_get_value(field);
-    if ((int32_t)lroundf(sq->getBpm()) == v) return;
+    const uint32_t key = lv_event_get_key(e);
+    const int step = key == LV_KEY_RIGHT || key == LV_KEY_UP ? 1 : (key == LV_KEY_LEFT || key == LV_KEY_DOWN ? -1 : 0);
+    /* The DAW's clock owns the tempo while it drives: a turn changes
+     * nothing, and sequences.json is left alone. */
+    if (!step || s_tempoFromHost.load(std::memory_order_relaxed)) return;
+    const int32_t v = std::max<int32_t>((int32_t)crosspad::SequencerLimits::MIN_BPM,
+                      std::min<int32_t>((int32_t)crosspad::SequencerLimits::MAX_BPM,
+                                        (int32_t)lroundf(sq->getBpm()) + step));
     sq->setBpm((float)v);
+    sync_ui();
 }
 
 /// A bar of click before a take started from a stop, so the first hit lands
@@ -454,23 +467,71 @@ void erase_cb(lv_event_t* e)
     paint(s_eraseBtn, on ? kRec : kPanel, on);
 }
 
+// ── transport, alone or with the song ──────────────────────────────────────
+
+crosspad::ISongEngine* songs() { return crosspad::getPlatformServices().songEngine; }
+
+/// SYNC on and a song to play: the transport starts the song, and the song
+/// starts the sequencer with it (Arrange's SYNC is the same switch).
+bool song_sync()
+{
+    auto* se = songs();
+    if (!se) return false;
+    std::lock_guard<std::recursive_mutex> l(se->songMutex());
+    return se->song().syncSeq && se->song().playEnd() > 0;
+}
+
+void sync_cb(lv_event_t*)
+{
+    auto* se = songs();
+    if (!se) return;
+    {
+        std::lock_guard<std::recursive_mutex> l(se->songMutex());
+        se->song().syncSeq = !se->song().syncSeq;
+    }
+    se->commit();
+    sync_ui();
+}
+
+/// From a stop, in sync: the song from its top, the sequencer doing @p take.
+bool start_with_song(crosspad::SyncTake take)
+{
+    auto* se = songs();
+    return !running() && song_sync() && se->playWithTake(0, take);
+}
+
 /// A second REC closes the take without stopping the loop, which is what you
 /// want after playing the part in.
 void rec_cb(lv_event_t*)
 {
     auto* sq = seq();
     if (!sq) return;
-    if (sq->isRecording()) sq->playback();
-    else                   sq->record();
+    if (sq->isRecording())                                  sq->playback();
+    else if (!start_with_song(crosspad::SyncTake::Record))  sq->record();
     sync_ui();
 }
-void dub_cb(lv_event_t*)  { if (auto* sq = seq()) sq->overdub();  sync_ui(); }
-void play_cb(lv_event_t*) { if (auto* sq = seq()) sq->playback(); sync_ui(); }
-void stop_cb(lv_event_t*) { if (auto* sq = seq()) sq->stop();     sync_ui(); }
+void dub_cb(lv_event_t*)
+{
+    auto* sq = seq();
+    if (sq && !start_with_song(crosspad::SyncTake::Overdub)) sq->overdub();
+    sync_ui();
+}
+void play_cb(lv_event_t*)
+{
+    auto* sq = seq();
+    if (sq && !start_with_song(crosspad::SyncTake::None)) sq->playback();
+    sync_ui();
+}
+/// The song too, when it is the one running the sequencer.
+void stop_cb(lv_event_t*)
+{
+    auto* se = songs();
+    if (se && se->playing() && song_sync()) se->stop();
+    if (auto* sq = seq()) sq->stop();
+    sync_ui();
+}
 
 // ── bounce ─────────────────────────────────────────────────────────────────
-
-crosspad::ISongEngine* songs() { return crosspad::getPlatformServices().songEngine; }
 
 void bounce_close()
 {
@@ -653,59 +714,32 @@ lv_obj_t* make_row(lv_obj_t* parent, int32_t h)
 }
 
 /// Tempo: focus it, press to edit, turn a BPM at a time, press again to
-/// leave. One BPM per detent always -- a spinbox steps by whichever digit its
-/// cursor stands on, so the cursor is pinned to the last one.
+/// leave. A button that shows the whole number, not a spinbox: the spinbox is
+/// a text area that scrolls to its cursor, and in edit mode it showed only the
+/// last digit. A tap puts it in edit mode too, for the encoder to turn.
 lv_obj_t* make_bpm(lv_obj_t* parent)
 {
-    auto* sq = seq();
-    const int32_t start = sq ? (int32_t)lroundf(sq->getBpm()) : 120;
-    s_bpmSyncing = true;
-    lv_obj_t* sp = lv_CreateStandardSpinbox(parent,
-                                            (int32_t)crosspad::SequencerLimits::MIN_BPM,
-                                            (int32_t)crosspad::SequencerLimits::MAX_BPM,
-                                            start > 0 ? start : 120, bpm_cb,
+    lv_obj_t* b = lv_CreateEditableButton(parent);
+    lv_obj_set_size(b, 44, 22);
+    lv_obj_set_style_pad_all(b, 0, 0);
+    lv_obj_set_style_radius(b, 6, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_bg_color(b, kPanel, 0);
+    lv_obj_set_style_bg_color(b, kAccent, LV_STATE_EDITED);
+    lv_obj_set_style_outline_color(b, kHead, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(b, 2, LV_STATE_FOCUS_KEY);
+    lv_obj_t* l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(l, kText, 0);
+    lv_obj_set_style_text_color(l, kInk, LV_STATE_EDITED);
+    lv_obj_add_flag(l, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, bpm_cb, LV_EVENT_KEY, nullptr);
+    lv_obj_add_event_cb(b, bpm_cb, LV_EVENT_CLICKED, nullptr);
 #ifdef SEQ_USE_ENCODER
-                                            s_encGroup,
-#else
-                                            nullptr,
+    if (s_encGroup) lv_group_add_obj(s_encGroup, b);
 #endif
-                                            nullptr, &lv_font_montserrat_14);
-    s_bpmSyncing = false;
-    lv_obj_set_size(sp, 40, 22);
-    lv_obj_set_style_pad_all(sp, 0, 0);
-    lv_obj_set_style_radius(sp, 6, 0);
-    lv_obj_set_style_bg_color(sp, kPanel, 0);
-    lv_obj_set_style_border_width(sp, 0, 0);
-    lv_obj_set_style_text_color(sp, kText, 0);
-    lv_obj_set_style_text_align(sp, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_bg_opa(sp, LV_OPA_TRANSP, LV_PART_CURSOR);
-    lv_obj_set_style_text_color(sp, kText, LV_PART_CURSOR);
-    lv_obj_set_style_bg_color(sp, kAccent, LV_STATE_EDITED);
-    lv_obj_set_style_text_color(sp, kInk, LV_STATE_EDITED);
-    lv_obj_set_style_outline_color(sp, kHead, LV_STATE_FOCUS_KEY);
-    lv_obj_set_style_outline_width(sp, 2, LV_STATE_FOCUS_KEY);
-    lv_spinbox_set_cursor_pos(sp, 0);
-    lv_spinbox_set_step(sp, 1);
-    lv_obj_remove_flag(sp, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scroll_dir(sp, LV_DIR_NONE);
-    if (lv_obj_t* l = lv_textarea_get_label(sp)) {
-        lv_obj_set_width(l, LV_PCT(100));
-        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_align(l, LV_ALIGN_CENTER, 0, 0);
-    }
-    /* Pinning the cursor rewrites the text and sends VALUE_CHANGED, so it is
-     * done as a sync: what comes back is ours, not a tempo somebody dialled. */
-    auto pin = [](lv_event_t* e) {
-        lv_obj_t* s = static_cast<lv_obj_t*>(lv_event_get_target(e));
-        const bool was = s_bpmSyncing;
-        s_bpmSyncing = true;
-        lv_spinbox_set_cursor_pos(s, 0);
-        lv_spinbox_set_step(s, 1);
-        s_bpmSyncing = was;
-    };
-    lv_obj_add_event_cb(sp, pin, LV_EVENT_FOCUSED, nullptr);
-    lv_obj_add_event_cb(sp, pin, LV_EVENT_CLICKED, nullptr);
-    return sp;
+    return b;
 }
 
 } // namespace
@@ -783,10 +817,11 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
 
     // -- transport --
     lv_obj_t* tr = make_row(s_root, 28);
-    s_recBtn  = make_button(tr, 74, 28, "REC", rec_cb);
-    s_dubBtn  = make_button(tr, 74, 28, "DUB", dub_cb);
-    s_playBtn = make_button(tr, 74, 28, LV_SYMBOL_PLAY, play_cb);
-    s_stopBtn = make_button(tr, 74, 28, LV_SYMBOL_STOP, stop_cb);
+    s_recBtn  = make_button(tr, 58, 28, "REC", rec_cb);
+    s_dubBtn  = make_button(tr, 58, 28, "DUB", dub_cb);
+    s_playBtn = make_button(tr, 58, 28, LV_SYMBOL_PLAY, play_cb);
+    s_stopBtn = make_button(tr, 58, 28, LV_SYMBOL_STOP, stop_cb);
+    s_syncBtn = make_button(tr, 58, 28, "SYNC", sync_cb);
 
     sync_ui();
     s_drawn = pattern_shape();
@@ -833,7 +868,7 @@ void Sequencer_destroy(lv_obj_t* root)
 #endif
     s_bounceBox = s_bounceText = s_bounceBar = s_bounceBtn = nullptr;
     s_bouncing = false;
-    s_root = s_grid = s_bpm = s_clickBtn = s_preBtn = s_barsLabel = nullptr;
+    s_root = s_grid = s_bpm = s_syncBtn = s_clickBtn = s_preBtn = s_barsLabel = nullptr;
     s_quantBtn = s_quantLabel = s_sceneLabel = s_eraseBtn = nullptr;
     s_recBtn = s_dubBtn = s_playBtn = s_stopBtn = nullptr;
 
