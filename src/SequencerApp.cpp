@@ -538,7 +538,8 @@ void bounce_close()
     if (!s_bounceBox) return;
 #ifdef SEQ_USE_ENCODER
     if (indev_encoderTop && s_encGroup) lv_indev_set_group(indev_encoderTop, s_encGroup);
-    if (s_bounceGroup) { lv_group_delete(s_bounceGroup); s_bounceGroup = nullptr; }
+    lv_group_delete_deferred(s_bounceGroup);          // its OK/Cancel click is still being read
+    s_bounceGroup = nullptr;
 #endif
     lv_obj_delete_async(s_bounceBox);
     s_bounceBox = s_bounceText = s_bounceBar = s_bounceBtn = nullptr;
