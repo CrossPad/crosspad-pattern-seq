@@ -40,6 +40,8 @@
 #include "crosspad-gui/widgets/spinbox_helpers.h"
 
 #include "lvgl.h"
+/* lv_image_cache_drop(): lvgl.h stopped exporting the cache in 9.4. */
+#include "src/misc/cache/instance/lv_image_cache.h"
 
 #include <atomic>
 #include <cmath>
@@ -246,10 +248,10 @@ uint32_t pattern_shape()
 void paint(lv_obj_t* b, lv_color_t bg, bool dark)
 {
     if (!b) return;
-    if (!lv_color_eq(lv_obj_get_style_bg_color(b, 0), bg)) lv_obj_set_style_bg_color(b, bg, 0);
+    if (!lv_color_eq(lv_obj_get_style_bg_color(b, LV_PART_MAIN), bg)) lv_obj_set_style_bg_color(b, bg, 0);
     lv_obj_t* l = lv_obj_get_child(b, 0);
     const lv_color_t ink = dark ? kInk : kText;
-    if (l && !lv_color_eq(lv_obj_get_style_text_color(l, 0), ink)) lv_obj_set_style_text_color(l, ink, 0);
+    if (l && !lv_color_eq(lv_obj_get_style_text_color(l, LV_PART_MAIN), ink)) lv_obj_set_style_text_color(l, ink, 0);
 }
 
 void set_text(lv_obj_t* l, const char* text)
@@ -314,7 +316,7 @@ void sync_ui()
     }
     set_text(s_sceneLabel, buf);
     const lv_color_t sceneInk = pending != active ? kAmber : kText;
-    if (!lv_color_eq(lv_obj_get_style_text_color(s_sceneLabel, 0), sceneInk)) {
+    if (!lv_color_eq(lv_obj_get_style_text_color(s_sceneLabel, LV_PART_MAIN), sceneInk)) {
         lv_obj_set_style_text_color(s_sceneLabel, sceneInk, 0);
     }
 
@@ -326,7 +328,7 @@ void sync_ui()
             s_bpmSyncing = false;
         }
         const lv_color_t field = s_tempoFromHost.load(std::memory_order_relaxed) ? kHostClock : kPanel;
-        if (!lv_color_eq(lv_obj_get_style_bg_color(s_bpm, 0), field)) {
+        if (!lv_color_eq(lv_obj_get_style_bg_color(s_bpm, LV_PART_MAIN), field)) {
             lv_obj_set_style_bg_color(s_bpm, field, 0);
         }
     }

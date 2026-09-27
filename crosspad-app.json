@@ -1,7 +1,7 @@
 {
   "name": "Sequencer",
   "id": "sequencer",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Record, loop and erase scenes on the pads",
   "category": "music",
   "icon": "sequencer.png",
