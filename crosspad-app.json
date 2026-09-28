@@ -1,7 +1,7 @@
 {
   "name": "Sequencer",
   "id": "sequencer",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Record, loop and erase scenes on the pads",
   "category": "music",
   "icon": "sequencer.png",
@@ -15,6 +15,7 @@
     "crosspad-gui": ">=1.13.0"
   },
   "changelog": [
+    "0.3.2: BPM: a value being turned reads dark on the accent: the text colour sits on the button, which is the only thing ever EDITED, not on its label",
     "0.3.1: builds on the PC against LVGL 9.4 (0.2.1 merged in)",
     "0.3.0: SYNC on the transport (the song's switch): PLAY, REC and DUB from a stop start the arrangement and the sequencer with it, STOP stops both; pad 1 at the bottom of the grid; tempo is a button that shows the whole number, clicked to turn and clicked to leave (a spinbox scrolled its digits out of sight); requires core 1.23 and gui 1.13",
     "0.2.0: tempo field follows a host's MIDI clock and refuses edits while it drives (from the Sampler, ae3dc82); count-in is one bar of the metre; requires core 1.21 and gui 1.12",

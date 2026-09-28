@@ -729,12 +729,13 @@ lv_obj_t* make_bpm(lv_obj_t* parent)
     lv_obj_set_style_shadow_width(b, 0, 0);
     lv_obj_set_style_bg_color(b, kPanel, 0);
     lv_obj_set_style_bg_color(b, kAccent, LV_STATE_EDITED);
+    /* On the button: only it is ever EDITED; the label takes the colour. */
+    lv_obj_set_style_text_color(b, kText, 0);
+    lv_obj_set_style_text_color(b, kInk, LV_STATE_EDITED);
     lv_obj_set_style_outline_color(b, kHead, LV_STATE_FOCUS_KEY);
     lv_obj_set_style_outline_width(b, 2, LV_STATE_FOCUS_KEY);
     lv_obj_t* l = lv_label_create(b);
     lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(l, kText, 0);
-    lv_obj_set_style_text_color(l, kInk, LV_STATE_EDITED);
     lv_obj_add_flag(l, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_center(l);
     lv_obj_add_event_cb(b, bpm_cb, LV_EVENT_KEY, nullptr);
