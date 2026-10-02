@@ -304,10 +304,12 @@ void sync_ui()
     paint(s_quantBtn, off ? kAmber : kPanel, off);
     const char* q = "1/16";
     switch (sq->getQuantization()) {
-        case crosspad::Quantization::Quarter:      q = "1/4";  break;
-        case crosspad::Quantization::Eighth:       q = "1/8";  break;
-        case crosspad::Quantization::ThirtySecond: q = "1/32"; break;
-        case crosspad::Quantization::Off:          q = "free"; break;
+        case crosspad::Quantization::Quarter:          q = "1/4";   break;
+        case crosspad::Quantization::Eighth:           q = "1/8";   break;
+        case crosspad::Quantization::EighthTriplet:    q = "1/8T";  break;
+        case crosspad::Quantization::SixteenthTriplet: q = "1/16T"; break;
+        case crosspad::Quantization::ThirtySecond:     q = "1/32";  break;
+        case crosspad::Quantization::Off:              q = "free";  break;
         default: break;
     }
     set_text(s_quantLabel, q);
@@ -422,19 +424,23 @@ void bars_cb(lv_event_t*)
     sync_ui();
 }
 
-/// Off, 1/4, 1/8, 1/16, 1/32 and round. Off is one press away because a part
-/// with feel in it is ruined by the same snap that flatters most playing.
+/// 1/4, 1/8, 1/8T, 1/16, 1/16T, 1/32, free, and round again. The triplets sit
+/// where they belong by density -- three to the beat is between two and four --
+/// so one way round the button is coarse to fine and nothing jumps back. Free
+/// stands one press past the finest, because a part with feel in it is ruined by
+/// the same snap that flatters most playing.
 void quant_cb(lv_event_t*)
 {
     auto* sq = seq();
     if (!sq) return;
-    switch (sq->getQuantization()) {
-        case crosspad::Quantization::Off:       sq->setQuantization(crosspad::Quantization::Quarter);      break;
-        case crosspad::Quantization::Quarter:   sq->setQuantization(crosspad::Quantization::Eighth);       break;
-        case crosspad::Quantization::Eighth:    sq->setQuantization(crosspad::Quantization::Sixteenth);    break;
-        case crosspad::Quantization::Sixteenth: sq->setQuantization(crosspad::Quantization::ThirtySecond); break;
-        default:                                sq->setQuantization(crosspad::Quantization::Off);          break;
-    }
+    using Q = crosspad::Quantization;
+    static const Q kRound[] = {Q::Quarter, Q::Eighth, Q::EighthTriplet, Q::Sixteenth,
+                               Q::SixteenthTriplet, Q::ThirtySecond, Q::Off};
+    constexpr size_t kCount = sizeof(kRound) / sizeof(kRound[0]);
+    const Q now = sq->getQuantization();
+    size_t i = 0;
+    while (i < kCount && kRound[i] != now) ++i;
+    sq->setQuantization(kRound[i + 1 < kCount ? i + 1 : 0]);   // nothing known: back to 1/4
     sync_ui();
 }
 
@@ -496,10 +502,21 @@ void sync_cb(lv_event_t*)
 }
 
 /// From a stop, in sync: the song from its top, the sequencer doing @p take.
+///
+/// PRE counts here exactly as it does without the song. The count-in belongs to
+/// the take, and in sync it is the metronome that plays it -- the song and the
+/// scene both start on the sample after the last click. Until this asked for it
+/// the switch quietly dropped PRE: a take started from here goes in through the
+/// song's transport, and only a take started on its own ever read the sequencer
+/// and counted. Plain PLAY is still immediate, with the song or without it,
+/// which is what PRE has always meant on this screen.
 bool start_with_song(crosspad::SyncTake take)
 {
     auto* se = songs();
-    return !running() && song_sync() && se->playWithTake(0, take);
+    if (!se || running() || !song_sync()) return false;
+    auto* sq = seq();
+    const uint8_t beats = (take != crosspad::SyncTake::None && sq) ? sq->getCountInBeats() : 0;
+    return beats ? se->playCountedIn(0, take, beats) : se->playWithTake(0, take);
 }
 
 /// A second REC closes the take without stopping the loop, which is what you
