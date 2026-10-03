@@ -45,6 +45,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -62,6 +63,33 @@ extern "C" {
 #endif
 
 namespace {
+
+/* ── set_text_fmt() is not used here, and this is why ─────────────
+ *
+ * It frees the label's old text and allocates the new one, but it does not
+ * revert the dots of a truncated label first -- lv_label_set_text() does
+ * exactly that, one line in, "in case text == label->text". So when a long
+ * line is replaced by a shorter one, LVGL still holds the offset the dots were
+ * written at, and on the next refresh it puts the four saved characters back at
+ * that offset -- past the end of the new, shorter buffer. The heap block next
+ * door loses its tail canary, and the crash lands minutes later on whatever
+ * frees that block: an assert deep inside LVGL, with nothing in the backtrace
+ * to say who wrote the bytes. It read as "Arrange crashes when I click a
+ * block", because this screen is the one that formats a line of changing length
+ * on every click.
+ *
+ * Formatting it ourselves and handing lv_label_set_text() a finished string is
+ * both the safe way and what every other screen in this firmware does. */
+static void set_text_fmt(lv_obj_t* label, const char* fmt, ...)
+{
+    if (!label || !fmt) return;
+    char buf[160];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    lv_label_set_text(label, buf);
+}
 
 constexpr uint32_t kTickMs = 50;
 constexpr int      kLanes  = 16;
@@ -611,7 +639,7 @@ void bounce_track_cb(lv_event_t* e)
     lv_obj_set_style_text_color(s_bounceText, kText, 0);
     lv_obj_set_width(s_bounceText, LV_PCT(100));
     lv_label_set_long_mode(s_bounceText, LV_LABEL_LONG_WRAP);
-    lv_label_set_text_fmt(s_bounceText, "Bouncing Seq %u to track %u...",
+    set_text_fmt(s_bounceText, "Bouncing Seq %u to track %u...",
                           (unsigned)(scene + 1), (unsigned)(track + 1));
     s_bounceBar = lv_bar_create(s_bounceBox);
     lv_obj_set_size(s_bounceBar, LV_PCT(100), 10);
@@ -647,10 +675,10 @@ void bounce_progress()
     if (st.state == crosspad::BounceState::Done) {
         lv_bar_set_value(s_bounceBar, 1000, LV_ANIM_OFF);
         lv_obj_set_style_bg_color(s_bounceBar, kPlay, LV_PART_INDICATOR);
-        lv_label_set_text_fmt(s_bounceText, "Done: %s is on its track in Arrange.%s%s", st.file.c_str(),
+        set_text_fmt(s_bounceText, "Done: %s is on its track in Arrange.%s%s", st.file.c_str(),
                               st.error.empty() ? "" : "\nNote: ", st.error.c_str());
     } else {
-        lv_label_set_text_fmt(s_bounceText, "Bounce failed: %s", st.error.c_str());
+        set_text_fmt(s_bounceText, "Bounce failed: %s", st.error.c_str());
     }
     lv_label_set_text(lv_obj_get_child(s_bounceBtn, 0), "OK");
 }
@@ -684,7 +712,7 @@ void bounce_cb(lv_event_t*)
     lv_obj_set_style_text_color(t, kText, 0);
     lv_obj_set_width(t, LV_PCT(100));
     lv_label_set_long_mode(t, LV_LABEL_LONG_WRAP);
-    lv_label_set_text_fmt(t, "Bounce Seq %u (%u bars) into \"%s\" -- on which track?",
+    set_text_fmt(t, "Bounce Seq %u (%u bars) into \"%s\" -- on which track?",
                           (unsigned)(sq->getActiveScene() + 1),
                           (unsigned)sq->getSceneBars(sq->getActiveScene()),
                           project.empty() ? "no card" : project.c_str());
