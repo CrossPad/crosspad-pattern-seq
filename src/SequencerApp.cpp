@@ -149,6 +149,10 @@ int32_t  s_headX = -1;   // screen x of the playhead as drawn, -1 = none
 lv_group_t* s_encGroup = nullptr;
 lv_group_t* s_prevEncGroup = nullptr;
 lv_group_t* s_bounceGroup = nullptr;
+lv_obj_t*   s_swingBox  = nullptr;      ///< the swing window, over the screen
+lv_obj_t*   s_swingText = nullptr;      ///< what it is set to, in words
+lv_obj_t*   s_swingBtn  = nullptr;      ///< SWING on the top row
+lv_group_t* s_swingGroup = nullptr;
 #endif
 
 crosspad::SequencerController* seq()
@@ -315,6 +319,16 @@ void sync_ui()
     if (waiting != s_recBtn) set_text(lv_obj_get_child(s_recBtn, 0), "REC");
     if (waiting != s_dubBtn) set_text(lv_obj_get_child(s_dubBtn, 0), "DUB");
     paint(s_preBtn, sq->getCountIn() ? kAmber : kPanel, sq->getCountIn());
+    /* The amount on the button: a feel you cannot see the value of is one you
+     * cannot put back where it was. */
+    if (s_swingBtn) {
+        const uint8_t sw = sq->getSwing();
+        paint(s_swingBtn, sw ? kAmber : kPanel, sw != 0);
+        char sb[12];
+        if (sw) std::snprintf(sb, sizeof(sb), "SW %u", (unsigned)sw);
+        else    std::snprintf(sb, sizeof(sb), "SWING");
+        set_text(lv_obj_get_child(s_swingBtn, 0), sb);
+    }
     paint(s_playBtn, (run && !rec && !dub) ? kPlay : kPanel, run && !rec && !dub);
     paint(s_stopBtn, kPanel, false);
     paint(s_clickBtn, sq->getClickActive() ? kAmber : kPanel, sq->getClickActive());
@@ -602,6 +616,29 @@ void bounce_close_cb(lv_event_t*)
     bounce_close();
 }
 
+/// A row of the swing window. Its own maker rather than the bounce one, which
+/// adds itself to that window's group.
+lv_obj_t* swing_button(lv_obj_t* parent, const char* text, lv_event_cb_t cb, void* ud)
+{
+    lv_obj_t* b = lv_button_create(parent);
+    lv_obj_set_size(b, LV_PCT(100), 24);
+    lv_obj_set_style_radius(b, 6, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_bg_color(b, kPanel, 0);
+    lv_obj_set_style_outline_color(b, kHead, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(b, 2, LV_STATE_FOCUS_KEY);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
+    lv_obj_t* l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(l, kText, 0);
+    lv_label_set_text(l, text);
+    lv_obj_center(l);
+#ifdef SEQ_USE_ENCODER
+    if (s_swingGroup) lv_group_add_obj(s_swingGroup, b);
+#endif
+    return b;
+}
+
 lv_obj_t* bounce_button(lv_obj_t* parent, const char* text, lv_event_cb_t cb, void* ud)
 {
     lv_obj_t* b = lv_button_create(parent);
@@ -681,6 +718,127 @@ void bounce_progress()
         set_text_fmt(s_bounceText, "Bounce failed: %s", st.error.c_str());
     }
     lv_label_set_text(lv_obj_get_child(s_bounceBtn, 0), "OK");
+}
+
+// ── swing ──────────────────────────────────────────────────────────────────
+
+/* Swing is late, not moved: every second subdivision sounds a share of one
+ * later, the pattern keeps its straight positions, and turning it off puts the
+ * feel back exactly where it was. It is applied on the way out (see
+ * PatternSequencer::swung), and a take recorded while it is on is pulled back
+ * to the straight grid first -- the player aims at what they hear.
+ *
+ * Its own window because it is two settings, not one: how much, and which
+ * subdivision. A button that only cycled through amounts would make the second
+ * one unreachable, and a hold-to-edit knob would hide both. */
+
+void swing_close()
+{
+    if (!s_swingBox) return;
+#ifdef SEQ_USE_ENCODER
+    if (indev_encoderTop && s_encGroup) lv_indev_set_group(indev_encoderTop, s_encGroup);
+    lv_group_delete_deferred(s_swingGroup);   // the click that closed it is still being read
+    s_swingGroup = nullptr;
+#endif
+    lv_obj_delete_async(s_swingBox);
+    s_swingBox = s_swingText = nullptr;
+    sync_ui();
+}
+
+void swing_close_cb(lv_event_t*) { swing_close(); }
+
+/// The line at the top of the window: what the setting means, in beats.
+void swing_paint()
+{
+    auto* sq = seq();
+    if (!sq || !s_swingText) return;
+    const uint8_t pct = sq->getSwing();
+    const uint8_t per = sq->getSwingPerBeat();
+    if (!pct) {
+        set_text(s_swingText, "Straight -- every subdivision on its own line");
+    } else {
+        set_text_fmt(s_swingText, "%u %% late on every second 1/%u%s",
+                     (unsigned)pct, (unsigned)(per * 4),
+                     pct >= 48 && pct <= 52 ? "   (triplet feel)" : "");
+    }
+}
+
+void swing_step_cb(lv_event_t* e)
+{
+    auto* sq = seq();
+    if (!sq) return;
+    const int by = (int)(intptr_t)lv_event_get_user_data(e);
+    const int now = (int)sq->getSwing() + by;
+    sq->setSwing((uint8_t)(now < 0 ? 0 : (now > 75 ? 75 : now)));
+    swing_paint();
+}
+
+void swing_set_cb(lv_event_t* e)
+{
+    auto* sq = seq();
+    if (!sq) return;
+    sq->setSwing((uint8_t)(intptr_t)lv_event_get_user_data(e));
+    swing_paint();
+}
+
+void swing_unit_cb(lv_event_t* e)
+{
+    auto* sq = seq();
+    if (!sq) return;
+    sq->setSwingPerBeat(sq->getSwingPerBeat() == 2 ? 4 : 2);
+    swing_paint();
+    /* The button says which one it is, so it has to be repainted too. */
+    if (lv_obj_t* b = static_cast<lv_obj_t*>(lv_event_get_current_target(e))) {
+        if (lv_obj_t* l = lv_obj_get_child(b, 0)) {
+            set_text_fmt(l, "Swing the 1/%u", (unsigned)(sq->getSwingPerBeat() * 4));
+        }
+    }
+}
+
+void swing_cb(lv_event_t*)
+{
+    auto* sq = seq();
+    if (!sq || s_swingBox) return;
+
+    s_swingBox = lv_obj_create(s_root);
+    lv_obj_remove_style_all(s_swingBox);
+    lv_obj_set_size(s_swingBox, LV_PCT(100), LV_PCT(100));
+    lv_obj_add_flag(s_swingBox, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_style_bg_color(s_swingBox, kBg, 0);
+    lv_obj_set_style_bg_opa(s_swingBox, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(s_swingBox, 8, 0);
+    lv_obj_set_style_pad_row(s_swingBox, 4, 0);
+    lv_obj_set_flex_flow(s_swingBox, LV_FLEX_FLOW_COLUMN);
+    lv_obj_remove_flag(s_swingBox, LV_OBJ_FLAG_SCROLLABLE);
+#ifdef SEQ_USE_ENCODER
+    s_swingGroup = lv_group_create();
+    if (indev_encoderTop) lv_indev_set_group(indev_encoderTop, s_swingGroup);
+#endif
+
+    lv_obj_t* title = lv_label_create(s_swingBox);
+    lv_obj_set_style_text_color(title, kText, 0);
+    lv_label_set_text(title, "SWING");
+
+    s_swingText = lv_label_create(s_swingBox);
+    lv_obj_set_style_text_font(s_swingText, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(s_swingText, kAmber, 0);
+    lv_label_set_long_mode(s_swingText, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_swingText, LV_PCT(100));
+    lv_label_set_text(s_swingText, "");
+
+    lv_obj_t* less = swing_button(s_swingBox, LV_SYMBOL_MINUS "  2 %", swing_step_cb, (void*)(intptr_t)-2);
+    swing_button(s_swingBox, LV_SYMBOL_PLUS "  2 %", swing_step_cb, (void*)(intptr_t)2);
+    char unit[20];
+    lv_snprintf(unit, sizeof(unit), "Swing the 1/%u", (unsigned)(sq->getSwingPerBeat() * 4));
+    swing_button(s_swingBox, unit, swing_unit_cb, nullptr);
+    swing_button(s_swingBox, "Triplet feel (50 %)", swing_set_cb, (void*)(intptr_t)50);
+    swing_button(s_swingBox, "Straight (off)", swing_set_cb, (void*)(intptr_t)0);
+    swing_button(s_swingBox, LV_SYMBOL_OK "  Done", swing_close_cb, nullptr);
+
+    swing_paint();
+#ifdef SEQ_USE_ENCODER
+    if (s_swingGroup) lv_group_focus_obj(less);
+#endif
 }
 
 void bounce_cb(lv_event_t*)
@@ -827,12 +985,16 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
     }
     s_clickBtn = make_button(top, 26, 22, "M", click_cb);
     s_preBtn = make_button(top, 30, 22, "PRE", pre_cb);
-    lv_obj_t* barsBtn = make_button(top, 30, 22, "4b", bars_cb);
+    lv_obj_t* barsBtn = make_button(top, 26, 22, "4b", bars_cb);
     s_barsLabel = lv_obj_get_child(barsBtn, 0);
     s_quantBtn = make_button(top, 36, 22, "1/16", quant_cb);
     s_quantLabel = lv_obj_get_child(s_quantBtn, 0);
-    make_button(top, 30, 22, "x2", double_cb);
-    make_button(top, 30, 22, "/2", halve_cb);
+    /* Beside the quantisation, because they are the same kind of thing: where
+     * a hit is put, and where it is heard. x2 and /2 give up six pixels each
+     * for it -- their labels are two characters. */
+    s_swingBtn = make_button(top, 44, 22, "SWING", swing_cb);
+    make_button(top, 24, 22, "x2", double_cb);
+    make_button(top, 24, 22, "/2", halve_cb);
 
     // -- which scene, and ERASE held beside it --
     lv_obj_t* scenes = make_row(s_root, 22);
@@ -914,8 +1076,10 @@ void Sequencer_destroy(lv_obj_t* root)
     if (auto* sq = seq()) sq->setErasing(false);
 #ifdef SEQ_USE_ENCODER
     if (s_bounceGroup) { lv_group_delete(s_bounceGroup); s_bounceGroup = nullptr; }
+    if (s_swingGroup) { lv_group_delete(s_swingGroup); s_swingGroup = nullptr; }
 #endif
     s_bounceBox = s_bounceText = s_bounceBar = s_bounceBtn = nullptr;
+    s_swingBox = s_swingText = s_swingBtn = nullptr;
     s_bouncing = false;
     s_root = s_grid = s_bpm = s_syncBtn = s_clickBtn = s_preBtn = s_barsLabel = nullptr;
     s_quantBtn = s_quantLabel = s_sceneLabel = s_eraseBtn = nullptr;
