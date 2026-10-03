@@ -151,6 +151,8 @@ lv_group_t* s_prevEncGroup = nullptr;
 lv_group_t* s_bounceGroup = nullptr;
 lv_obj_t*   s_swingBox  = nullptr;      ///< the swing window, over the screen
 lv_obj_t*   s_swingText = nullptr;      ///< what it is set to, in words
+lv_obj_t*   s_swingVal  = nullptr;      ///< the amount, turned with the encoder
+lv_obj_t*   s_swingChip[7] = {};        ///< the sampler's steps, 50 to 75
 lv_obj_t*   s_swingBtn  = nullptr;      ///< SWING on the top row
 lv_group_t* s_swingGroup = nullptr;
 #endif
@@ -616,6 +618,63 @@ void bounce_close_cb(lv_event_t*)
     bounce_close();
 }
 
+/* Both window makers hang callbacks that are written below them, and they use
+ * the row helper the main screen is built with. */
+void swing_val_cb(lv_event_t* e);
+void swing_set_cb(lv_event_t* e);
+lv_obj_t* make_row(lv_obj_t* parent, int32_t h);
+
+/// The amount, as a button the encoder turns: the idiom the tempo uses, so the
+/// gesture is the one already learned on the screen behind.
+lv_obj_t* swing_value(lv_obj_t* parent)
+{
+    lv_obj_t* b = lv_CreateEditableButton(parent);
+    lv_obj_set_size(b, 56, 26);
+    lv_obj_set_style_pad_all(b, 0, 0);
+    lv_obj_set_style_radius(b, 6, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_bg_color(b, kPanel, 0);
+    lv_obj_set_style_bg_color(b, kAccent, LV_STATE_EDITED);
+    lv_obj_set_style_text_color(b, kText, 0);
+    lv_obj_set_style_text_color(b, kInk, LV_STATE_EDITED);
+    lv_obj_set_style_outline_color(b, kHead, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(b, 2, LV_STATE_FOCUS_KEY);
+    lv_obj_t* l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+    lv_obj_add_flag(l, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, swing_val_cb, LV_EVENT_KEY, nullptr);
+    lv_obj_add_event_cb(b, swing_val_cb, LV_EVENT_CLICKED, nullptr);
+#ifdef SEQ_USE_ENCODER
+    if (s_swingGroup) lv_group_add_obj(s_swingGroup, b);
+#endif
+    return b;
+}
+
+/// One of the sampler's steps: a chip in a row, not a row of its own -- seven
+/// of them would not fit the screen and a step is one number.
+lv_obj_t* swing_chip(lv_obj_t* parent, const char* text, void* intensity)
+{
+    lv_obj_t* b = lv_button_create(parent);
+    lv_obj_set_size(b, 40, 24);
+    lv_obj_set_style_pad_all(b, 0, 0);
+    lv_obj_set_style_radius(b, 5, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_bg_color(b, kPanel, 0);
+    lv_obj_set_style_outline_color(b, kHead, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(b, 2, LV_STATE_FOCUS_KEY);
+    lv_obj_add_event_cb(b, swing_set_cb, LV_EVENT_CLICKED, intensity);
+    lv_obj_t* l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(l, kText, 0);
+    lv_label_set_text(l, text);
+    lv_obj_center(l);
+#ifdef SEQ_USE_ENCODER
+    if (s_swingGroup) lv_group_add_obj(s_swingGroup, b);
+#endif
+    return b;
+}
+
 /// A row of the swing window. Its own maker rather than the bounce one, which
 /// adds itself to that window's group.
 lv_obj_t* swing_button(lv_obj_t* parent, const char* text, lv_event_cb_t cb, void* ud)
@@ -741,35 +800,78 @@ void swing_close()
     s_swingGroup = nullptr;
 #endif
     lv_obj_delete_async(s_swingBox);
-    s_swingBox = s_swingText = nullptr;
+    s_swingBox = s_swingText = s_swingVal = nullptr;
+    for (auto& c : s_swingChip) c = nullptr;
     sync_ui();
 }
 
 void swing_close_cb(lv_event_t*) { swing_close(); }
 
-/// The line at the top of the window: what the setting means, in beats.
+/* The steps a sampler's swing knob clicks through, 50 % to 75 %, and what each
+ * is on the 0..100 scale: intensity = (sampler - 50) * 4. The triplet one is
+ * the exception -- those machines print 66 % and mean two thirds of the way
+ * through the pair, which is 67 here, so the chip says 66 and sets the feel
+ * rather than the rounding. */
+struct SwingStep { uint8_t sampler; uint8_t intensity; };
+const SwingStep kSwingSteps[7] = {
+    {50, 0}, {54, 16}, {58, 32}, {62, 48}, {66, 67}, {70, 80}, {75, 100},
+};
+
+/// What it is set to, in the two numbers a player might be thinking in.
 void swing_paint()
 {
     auto* sq = seq();
-    if (!sq || !s_swingText) return;
+    if (!sq) return;
     const uint8_t pct = sq->getSwing();
     const uint8_t per = sq->getSwingPerBeat();
-    if (!pct) {
-        set_text(s_swingText, "Straight -- every subdivision on its own line");
-    } else {
-        set_text_fmt(s_swingText, "%u %% late on every second 1/%u%s",
-                     (unsigned)pct, (unsigned)(per * 4),
-                     pct >= 48 && pct <= 52 ? "   (triplet feel)" : "");
+    if (s_swingVal) {
+        char v[8];
+        std::snprintf(v, sizeof(v), "%u", (unsigned)pct);
+        set_text(lv_obj_get_child(s_swingVal, 0), v);
+    }
+    if (s_swingText) {
+        if (!pct) {
+            set_text(s_swingText, "straight -- every subdivision on its own line");
+        } else {
+            set_text_fmt(s_swingText, "1/%u   .   sampler %u %%%s",
+                         (unsigned)(per * 4), (unsigned)(50 + pct / 4),
+                         pct >= 66 && pct <= 68 ? "   .   triplet feel" : "");
+        }
+    }
+    /* The step it is standing on, lit. Turned off a step, nothing is lit --
+     * which is the honest answer. */
+    for (int i = 0; i < 7; ++i) {
+        if (!s_swingChip[i]) continue;
+        const bool on = kSwingSteps[i].intensity == pct;
+        lv_obj_set_style_bg_color(s_swingChip[i], on ? kAmber : kPanel, 0);
+        if (lv_obj_t* l = lv_obj_get_child(s_swingChip[i], 0)) {
+            lv_obj_set_style_text_color(l, on ? kInk : kText, 0);
+        }
     }
 }
 
-void swing_step_cb(lv_event_t* e)
+/// The amount, turned: focus it, press to take it, a point per detent, press
+/// again to let go -- the same way the tempo is turned on the screen behind.
+void swing_val_cb(lv_event_t* e)
 {
     auto* sq = seq();
-    if (!sq) return;
-    const int by = (int)(intptr_t)lv_event_get_user_data(e);
-    const int now = (int)sq->getSwing() + by;
-    sq->setSwing((uint8_t)(now < 0 ? 0 : (now > 75 ? 75 : now)));
+    lv_obj_t* b = static_cast<lv_obj_t*>(lv_event_get_current_target(e));
+    if (!sq || !b) return;
+    lv_group_t* g = lv_obj_get_group(b);
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        if (g) {
+            const bool editing = lv_group_get_editing(g) && lv_group_get_focused(g) == b;
+            lv_group_focus_obj(b);
+            lv_group_set_editing(g, !editing);
+        }
+        return;
+    }
+    const uint32_t key = lv_event_get_key(e);
+    const int step = key == LV_KEY_RIGHT || key == LV_KEY_UP ? 1
+                   : (key == LV_KEY_LEFT || key == LV_KEY_DOWN ? -1 : 0);
+    if (!step) return;
+    const int now = (int)sq->getSwing() + step;
+    sq->setSwing((uint8_t)(now < 0 ? 0 : (now > 100 ? 100 : now)));
     swing_paint();
 }
 
@@ -826,18 +928,37 @@ void swing_cb(lv_event_t*)
     lv_obj_set_width(s_swingText, LV_PCT(100));
     lv_label_set_text(s_swingText, "");
 
-    lv_obj_t* less = swing_button(s_swingBox, LV_SYMBOL_MINUS "  2 %", swing_step_cb, (void*)(intptr_t)-2);
-    swing_button(s_swingBox, LV_SYMBOL_PLUS "  2 %", swing_step_cb, (void*)(intptr_t)2);
+    /* The amount, big, with the scale beside it: one knob from nothing to as
+     * far as those machines go. */
+    lv_obj_t* amount = make_row(s_swingBox, 30);
+    lv_obj_t* tag = lv_label_create(amount);
+    lv_obj_set_style_text_font(tag, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(tag, kDim, 0);
+    lv_label_set_text(tag, "AMOUNT");
+    s_swingVal = swing_value(amount);
+    lv_obj_t* of = lv_label_create(amount);
+    lv_obj_set_style_text_font(of, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(of, kDim, 0);
+    lv_label_set_text(of, "of 100");
+
     char unit[20];
     lv_snprintf(unit, sizeof(unit), "Swing the 1/%u", (unsigned)(sq->getSwingPerBeat() * 4));
     swing_button(s_swingBox, unit, swing_unit_cb, nullptr);
-    swing_button(s_swingBox, "Triplet feel (50 %)", swing_set_cb, (void*)(intptr_t)50);
-    swing_button(s_swingBox, "Straight (off)", swing_set_cb, (void*)(intptr_t)0);
+
+    /* The sampler's own steps, in a row: the numbers printed on those machines,
+     * so a groove learned on one lands here by name. */
+    lv_obj_t* steps = make_row(s_swingBox, 26);
+    for (int i = 0; i < 7; ++i) {
+        char label[8];
+        lv_snprintf(label, sizeof(label), "%u", (unsigned)kSwingSteps[i].sampler);
+        s_swingChip[i] = swing_chip(steps, label, (void*)(intptr_t)kSwingSteps[i].intensity);
+    }
+
     swing_button(s_swingBox, LV_SYMBOL_OK "  Done", swing_close_cb, nullptr);
 
     swing_paint();
 #ifdef SEQ_USE_ENCODER
-    if (s_swingGroup) lv_group_focus_obj(less);
+    if (s_swingGroup) lv_group_focus_obj(s_swingVal);
 #endif
 }
 
@@ -1079,7 +1200,8 @@ void Sequencer_destroy(lv_obj_t* root)
     if (s_swingGroup) { lv_group_delete(s_swingGroup); s_swingGroup = nullptr; }
 #endif
     s_bounceBox = s_bounceText = s_bounceBar = s_bounceBtn = nullptr;
-    s_swingBox = s_swingText = s_swingBtn = nullptr;
+    s_swingBox = s_swingText = s_swingVal = s_swingBtn = nullptr;
+    for (auto& c : s_swingChip) c = nullptr;
     s_bouncing = false;
     s_root = s_grid = s_bpm = s_syncBtn = s_clickBtn = s_preBtn = s_barsLabel = nullptr;
     s_quantBtn = s_quantLabel = s_sceneLabel = s_eraseBtn = nullptr;
