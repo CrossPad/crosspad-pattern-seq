@@ -31,9 +31,14 @@
 #include "crosspad/app/AppRegistrar.hpp"
 #include "crosspad/event/EventData.hpp"
 #include "crosspad/event/IEventBus.hpp"
+#include "crosspad/instrument/IInstrumentHost.hpp"
+#include "crosspad/instrument/PitchedInstrument.hpp"
 #include "crosspad/kit/IKitManager.hpp"
 #include "crosspad/kit/KitInfo.hpp"
+#include "crosspad/pad/IPadLogicHandler.hpp"
+#include "crosspad/pad/PadManager.hpp"
 #include "crosspad/platform/PlatformServices.hpp"
+#include "crosspad/sampletools/ISampleTools.hpp"
 #include "crosspad/sequencer/SequencerController.hpp"
 #include "crosspad/song/ISongEngine.hpp"
 #include "crosspad-gui/widgets/gui_helpers.h"
@@ -48,8 +53,10 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 // Encoder navigation is an embedded-only concern -- the simulator drives the UI
 // with a pointer. Snapshot whichever group was active before the app opened and
@@ -154,6 +161,20 @@ lv_obj_t*   s_swingText = nullptr;      ///< what it is set to, in words
 lv_obj_t*   s_swingVal  = nullptr;      ///< the amount, turned with the encoder
 lv_obj_t*   s_swingChip[7] = {};        ///< the sampler's steps, 50 to 75
 lv_obj_t*   s_swingBtn  = nullptr;      ///< SWING on the top row
+
+/* SRC: what the pads play, and the window that picks it. */
+lv_obj_t* s_srcBtn   = nullptr;         ///< SRC on the transport row
+lv_obj_t* s_srcLabel = nullptr;         ///< its text: KIT, or the instrument
+lv_obj_t* s_srcBox   = nullptr;         ///< the picker, over the screen
+lv_obj_t* s_srcList  = nullptr;         ///< the scrolling part of it
+lv_obj_t* s_srcNoteLbl = nullptr;       ///< a failure or "loading", under the list
+lv_obj_t* s_srcOctLbl  = nullptr;       ///< the base note
+lv_obj_t* s_srcMinus = nullptr;         ///< the three below the list; the group
+lv_obj_t* s_srcPlus  = nullptr;         ///< is rebuilt around them on every
+lv_obj_t* s_srcClose = nullptr;         ///< fill, so they keep their order
+lv_group_t* s_srcGroup = nullptr;
+std::vector<std::string> s_srcLib;      ///< instrument folder names
+bool s_srcListing = false;              ///< a folder request of ours is out
 lv_group_t* s_swingGroup = nullptr;
 #endif
 
@@ -173,6 +194,82 @@ bool running()
     auto* sq = seq();
     return sq && sq->getState() == crosspad::SequencerState::Running;
 }
+
+// ── what the pads play, and so what a take records ─────────────────────────
+
+/* The Sequencer has no sound of its own: it records whatever the pads make,
+ * and a bounce captures the pads bus (SongEngine::runBounce), so whichever of
+ * these is playing is what lands on the track. Until now that was always the
+ * kit. SRC also offers the instruments Pitch Play saves, so a melodic part can
+ * be recorded and bounced here rather than played by hand into the Sampler.
+ *
+ * The pitched engine and the kits' streamer share one arena, so an instrument
+ * is *borrowed* through IInstrumentHost: taking it stops the kits' engine,
+ * giving it back reloads the kit. Hence release() on the way out -- leave it
+ * borrowed and the Sampler comes back silent. The one exception is a bounce
+ * still running when the screen closes: it is capturing the pads, so the
+ * engine has to stay until it is done.
+ *
+ * The pads need a logic of their own in this mode (the Sampler's plays kit
+ * pads, not notes), pushed on the way in and popped on the way out. This app
+ * registers with plain REGISTER_APP and no padLogicName, so the push is ours
+ * to make -- an app declaring one must not. */
+
+constexpr uint8_t kSeqPads = 16;
+constexpr const char* kSrcPadLogic = "SeqPitch";
+
+enum class Src : uint8_t { Kit, Inst };
+
+Src         s_src = Src::Kit;
+std::string s_instPath;                  ///< logical path of the chosen instrument
+std::string s_instName;                  ///< what SRC and the window show
+std::string s_srcNote;                   ///< a failure or a progress line, for the window
+uint8_t     s_base = 60;                 ///< C4: the 16 pads are 16 semitones up from here
+std::atomic<bool> s_instReady{false};    ///< the bank is built and the pads may play it
+bool        s_padLogicPushed = false;
+
+crosspad::IInstrumentHost*   inst_host() { return crosspad::getPlatformServices().instrumentHost; }
+crosspad::PitchedInstrument* inst()      { return crosspad::getPlatformServices().pitchedInstrument; }
+crosspad::ISampleTools*      tools()     { return crosspad::getPlatformServices().sampleTools; }
+
+void note_name(int note, char* buf, size_t n)
+{
+    static const char* kNames[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+    if (note < 0 || note > 127) { std::snprintf(buf, n, "--"); return; }
+    std::snprintf(buf, n, "%s%d", kNames[note % 12], note / 12 - 1);
+}
+
+/// Pads as sixteen semitones from s_base. The note a pad started on is kept,
+/// so a pad released after the base moved still stops what it began.
+class SeqPitchPadLogic : public crosspad::IPadLogicHandler {
+public:
+    void onActivate(crosspad::PadManager&) override {}
+    void onDeactivate(crosspad::PadManager&) override
+    {
+        if (auto* p = inst()) p->allNotesOff();
+    }
+    void onPadPress(crosspad::PadManager& pm, uint8_t pad, uint8_t vel) override
+    {
+        if (pad >= kSeqPads || !s_instReady.load()) return;
+        auto* p = inst();
+        if (!p) return;
+        const uint8_t note = (uint8_t)std::min(127, (int)s_base + pad);
+        note_[pad].store(note);
+        p->noteOn(note, vel ? vel : 1, pad);
+        pm.notifyNoteOn(pad, vel ? vel : 1, true);
+    }
+    void onPadRelease(crosspad::PadManager& pm, uint8_t pad) override
+    {
+        if (pad >= kSeqPads) return;
+        if (auto* p = inst()) p->noteOff(note_[pad].load());
+        pm.notifyNoteOff(pad, true);
+    }
+    void onPadPressure(crosspad::PadManager&, uint8_t, uint8_t) override {}
+
+private:
+    std::atomic<uint8_t> note_[kSeqPads] = {};
+};
+std::shared_ptr<SeqPitchPadLogic> s_srcPadLogic;
 
 // ── pattern grid ───────────────────────────────────────────────────────────
 
@@ -388,10 +485,12 @@ void sync_ui()
 }
 
 void bounce_progress();
+void src_poll();
 
 void tick_cb(lv_timer_t*)
 {
     if (s_bouncing) bounce_progress();
+    src_poll();
     sync_ui();
     const uint32_t shape = pattern_shape();
     const int32_t x = head_x();
@@ -779,6 +878,323 @@ void bounce_progress()
     lv_label_set_text(lv_obj_get_child(s_bounceBtn, 0), "OK");
 }
 
+// ── SRC: the kit, or an instrument borrowed from Pitch Play ────────────────
+
+void src_sync()
+{
+    if (!s_srcLabel) return;
+    if (s_src == Src::Kit) { set_text(s_srcLabel, "KIT"); return; }
+    if (!s_instReady.load()) { set_text(s_srcLabel, "..."); return; }
+    /* Eight characters of font 10 fit the 48 px button; a longer name is cut
+     * with a dot, so a cut reads as one rather than as a misspelling. */
+    char buf[16];
+    if (s_instName.size() <= 8) std::snprintf(buf, sizeof(buf), "%s", s_instName.c_str());
+    else                        std::snprintf(buf, sizeof(buf), "%.7s.", s_instName.c_str());
+    set_text(s_srcLabel, buf);
+}
+
+/// The pads stop playing the kit and start playing notes. Idempotent.
+void src_take_pads()
+{
+    if (s_padLogicPushed) return;
+    auto& pm = crosspad::getPadManager();
+    if (!s_srcPadLogic) {
+        s_srcPadLogic = std::make_shared<SeqPitchPadLogic>();
+        pm.registerPadLogic(kSrcPadLogic, s_srcPadLogic);
+    }
+    pm.pushPadLogic(kSrcPadLogic);
+    s_padLogicPushed = true;
+}
+
+/// And back. Pop before anything unregisters the handler, or the pop lands on
+/// a name that no longer resolves and leaves the pads with no logic at all.
+void src_drop_pads()
+{
+    if (!s_padLogicPushed) return;
+    crosspad::getPadManager().popPadLogic();
+    s_padLogicPushed = false;
+}
+
+void src_fill();
+
+/// Give the engine back and let the kit load again.
+void src_to_kit()
+{
+    src_drop_pads();
+    s_instReady.store(false);
+    s_src = Src::Kit;
+    s_instPath.clear();
+    s_instName.clear();
+    s_srcNote.clear();
+    if (auto* h = inst_host()) h->release();
+    src_sync();
+    src_fill();
+}
+
+/// Borrow the engine for @p path. The load runs on the host's worker; the
+/// pads stay quiet until src_poll() sees Ready.
+void src_to_inst(const std::string& path, const std::string& name)
+{
+    auto* h = inst_host();
+    if (!h) { s_srcNote = "No instrument engine on this build."; src_fill(); return; }
+    if (!h->requestOpen(path)) { s_srcNote = "Busy -- try again."; src_fill(); return; }
+    s_src = Src::Inst;
+    s_instPath = path;
+    s_instName = name;
+    s_instReady.store(false);
+    s_srcNote = "Loading " + name + "...";
+    src_take_pads();          // before Ready: a hit now is silent, not a kit pad
+    src_sync();
+    src_fill();
+}
+
+/// Host and listing, from the app tick.
+void src_poll()
+{
+    if (s_srcListing) {
+        auto* st = tools();
+        if (st) {
+            const crosspad::ToolJob job = st->job();
+            if (job == crosspad::ToolJob::Ready || job == crosspad::ToolJob::Failed) {
+                s_srcLib.clear();
+                if (job == crosspad::ToolJob::Ready) {
+                    const auto f = st->folder();
+                    for (size_t i = 0; i < f.folders; ++i) s_srcLib.push_back(f.name(i));
+                }
+                s_srcListing = false;
+                src_fill();
+            }
+        } else {
+            s_srcListing = false;
+        }
+    }
+
+    if (s_src != Src::Inst) return;
+    auto* h = inst_host();
+    if (!h) return;
+    const auto state = h->state();
+    if (state == crosspad::IInstrumentHost::State::Ready) {
+        if (!s_instReady.exchange(true)) {
+            const std::string msg = h->message();
+            s_srcNote = msg.empty() ? std::string() : msg;
+            src_sync();
+            src_fill();
+        }
+    } else if (state == crosspad::IInstrumentHost::State::Failed) {
+        const std::string why = h->message();
+        src_to_kit();
+        s_srcNote = why.empty() ? std::string("Could not load that instrument.") : why;
+        src_fill();
+    }
+}
+
+void src_close()
+{
+    if (!s_srcBox) return;
+#ifdef SEQ_USE_ENCODER
+    if (indev_encoderTop && s_encGroup) lv_indev_set_group(indev_encoderTop, s_encGroup);
+    lv_group_delete_deferred(s_srcGroup);   // the click that closed it is still being read
+    s_srcGroup = nullptr;
+#endif
+    lv_obj_delete_async(s_srcBox);
+    s_srcBox = s_srcList = s_srcNoteLbl = s_srcOctLbl = nullptr;
+    s_srcMinus = s_srcPlus = s_srcClose = nullptr;
+    sync_ui();
+}
+
+void src_close_cb(lv_event_t*) { src_close(); }
+
+void src_pick_cb(lv_event_t* e)
+{
+    const auto idx = (size_t)(uintptr_t)lv_event_get_user_data(e);
+    if (idx == 0) { src_to_kit(); return; }
+    const size_t i = idx - 1;
+    if (i >= s_srcLib.size()) return;
+    auto* h = inst_host();
+    if (!h) return;
+    const std::string name = s_srcLib[i];
+    src_to_inst(h->libraryRoot() + "/" + name + "/" + crosspad::IInstrumentHost::kFileName, name);
+}
+
+void src_oct_cb(lv_event_t* e)
+{
+    const int d = (int)(intptr_t)lv_event_get_user_data(e);
+    const int base = (int)s_base + d * 12;
+    /* Sixteen pads from the base, so the top one must still be a note. */
+    if (base < 0 || base + (kSeqPads - 1) > 127) return;
+    s_base = (uint8_t)base;
+    if (auto* p = inst()) p->allNotesOff();
+    src_fill();
+}
+
+lv_obj_t* src_button(lv_obj_t* parent, const char* text, lv_event_cb_t cb, void* ud, bool on)
+{
+    lv_obj_t* b = lv_button_create(parent);
+    lv_obj_set_size(b, LV_PCT(100), 24);
+    lv_obj_set_style_radius(b, 6, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_bg_color(b, on ? kAccent : kPanel, 0);
+    lv_obj_set_style_outline_color(b, kHead, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(b, 2, LV_STATE_FOCUS_KEY);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
+    lv_obj_t* l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(l, on ? kInk : kText, 0);
+    lv_label_set_text(l, text);
+    lv_obj_center(l);
+#ifdef SEQ_USE_ENCODER
+    if (s_srcGroup) lv_group_add_obj(s_srcGroup, b);
+#endif
+    return b;
+}
+
+/// Rebuild the window's contents. Safe when it is closed -- the source can
+/// change from the poll, and then there is only the SRC label to update.
+void src_fill()
+{
+    src_sync();
+    if (!s_srcList) return;
+    /* Only the list is rebuilt. Deleting its buttons takes them out of the
+     * group by itself, so nothing else has to be removed -- an earlier
+     * lv_group_remove_all_objs() here took OCT and Close out with them and
+     * the encoder could never reach them again. */
+    lv_obj_clean(s_srcList);
+
+    src_button(s_srcList, "KIT -- the loaded kit", src_pick_cb, (void*)(uintptr_t)0,
+               s_src == Src::Kit);
+    for (size_t i = 0; i < s_srcLib.size(); ++i) {
+        char buf[40];
+        std::snprintf(buf, sizeof(buf), LV_SYMBOL_KEYBOARD " %.32s", s_srcLib[i].c_str());
+        src_button(s_srcList, buf, src_pick_cb, (void*)(uintptr_t)(i + 1),
+                   s_src == Src::Inst && s_instName == s_srcLib[i]);
+    }
+    if (s_srcLib.empty() && !s_srcListing) {
+        lv_obj_t* l = lv_label_create(s_srcList);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(l, kDim, 0);
+        lv_obj_set_width(l, LV_PCT(100));
+        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(l, "No instruments yet -- make one in Pitch Play and SAVE it.");
+    }
+
+    if (s_srcOctLbl) {
+        char n0[8], n1[8], buf[32];
+        note_name(s_base, n0, sizeof(n0));
+        note_name(std::min(127, (int)s_base + kSeqPads - 1), n1, sizeof(n1));
+        std::snprintf(buf, sizeof(buf), "%s - %s", n0, n1);
+        set_text(s_srcOctLbl, buf);
+    }
+    if (s_srcNoteLbl) set_text(s_srcNoteLbl, s_srcNote.c_str());
+
+#ifdef SEQ_USE_ENCODER
+    /* The list's new buttons were appended to the group; move the three
+     * below it back behind them so turning the encoder still walks the
+     * window top to bottom. */
+    if (s_srcGroup) {
+        for (lv_obj_t* o : {s_srcMinus, s_srcPlus, s_srcClose}) {
+            if (!o) continue;
+            lv_group_remove_obj(o);
+            lv_group_add_obj(s_srcGroup, o);
+        }
+    }
+#endif
+}
+
+void src_cb(lv_event_t*)
+{
+    if (s_srcBox) { src_close(); return; }
+
+    s_srcBox = lv_obj_create(s_root);
+    lv_obj_remove_style_all(s_srcBox);
+    lv_obj_set_size(s_srcBox, LV_PCT(100), LV_PCT(100));
+    lv_obj_add_flag(s_srcBox, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_style_bg_color(s_srcBox, kBg, 0);
+    lv_obj_set_style_bg_opa(s_srcBox, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(s_srcBox, 8, 0);
+    lv_obj_set_style_pad_row(s_srcBox, 4, 0);
+    lv_obj_set_flex_flow(s_srcBox, LV_FLEX_FLOW_COLUMN);
+    lv_obj_remove_flag(s_srcBox, LV_OBJ_FLAG_SCROLLABLE);
+
+#ifdef SEQ_USE_ENCODER
+    s_srcGroup = lv_group_create();
+    if (indev_encoderTop) lv_indev_set_group(indev_encoderTop, s_srcGroup);
+#endif
+
+    lv_obj_t* title = lv_label_create(s_srcBox);
+    lv_obj_set_style_text_color(title, kText, 0);
+    lv_label_set_text(title, "What the pads record");
+
+    s_srcList = lv_obj_create(s_srcBox);
+    lv_obj_remove_style_all(s_srcList);
+    lv_obj_set_width(s_srcList, LV_PCT(100));
+    lv_obj_set_flex_grow(s_srcList, 1);
+    lv_obj_set_flex_flow(s_srcList, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_srcList, 3, 0);
+
+    /* The sixteen pads' range, for an instrument. Shown always, so the window
+     * does not change shape when the source does. */
+    lv_obj_t* oct = make_row(s_srcBox, 24);
+    lv_obj_t* ol = lv_label_create(oct);
+    lv_obj_set_style_text_font(ol, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(ol, kDim, 0);
+    lv_label_set_text(ol, "Pads");
+    lv_obj_t* minus = lv_button_create(oct);
+    lv_obj_set_size(minus, 28, 22);
+    lv_obj_set_style_radius(minus, 6, 0);
+    lv_obj_set_style_shadow_width(minus, 0, 0);
+    lv_obj_set_style_bg_color(minus, kPanel, 0);
+    s_srcMinus = minus;
+    lv_obj_add_event_cb(minus, src_oct_cb, LV_EVENT_CLICKED, (void*)(intptr_t)-1);
+    lv_obj_center(lv_label_create(minus));
+    lv_label_set_text(lv_obj_get_child(minus, 0), LV_SYMBOL_MINUS);
+    s_srcOctLbl = lv_label_create(oct);
+    lv_obj_set_width(s_srcOctLbl, 70);
+    lv_obj_set_style_text_align(s_srcOctLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_srcOctLbl, kText, 0);
+    lv_label_set_text(s_srcOctLbl, "");
+    lv_obj_t* plus = lv_button_create(oct);
+    lv_obj_set_size(plus, 28, 22);
+    lv_obj_set_style_radius(plus, 6, 0);
+    lv_obj_set_style_shadow_width(plus, 0, 0);
+    lv_obj_set_style_bg_color(plus, kPanel, 0);
+    s_srcPlus = plus;
+    lv_obj_add_event_cb(plus, src_oct_cb, LV_EVENT_CLICKED, (void*)(intptr_t)1);
+    lv_obj_center(lv_label_create(plus));
+    lv_label_set_text(lv_obj_get_child(plus, 0), LV_SYMBOL_PLUS);
+#ifdef SEQ_USE_ENCODER
+    if (s_srcGroup) { lv_group_add_obj(s_srcGroup, minus); lv_group_add_obj(s_srcGroup, plus); }
+#endif
+
+    s_srcNoteLbl = lv_label_create(s_srcBox);
+    lv_obj_set_style_text_font(s_srcNoteLbl, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(s_srcNoteLbl, kAmber, 0);
+    lv_obj_set_width(s_srcNoteLbl, LV_PCT(100));
+    lv_label_set_long_mode(s_srcNoteLbl, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(s_srcNoteLbl, "");
+
+    lv_obj_t* close = lv_button_create(s_srcBox);
+    lv_obj_set_size(close, LV_PCT(100), 24);
+    lv_obj_set_style_radius(close, 6, 0);
+    lv_obj_set_style_shadow_width(close, 0, 0);
+    lv_obj_set_style_bg_color(close, kPanel, 0);
+    s_srcClose = close;
+    lv_obj_add_event_cb(close, src_close_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_center(lv_label_create(close));
+    lv_label_set_text(lv_obj_get_child(close, 0), "Close");
+#ifdef SEQ_USE_ENCODER
+    if (s_srcGroup) { lv_group_add_obj(s_srcGroup, close); lv_group_focus_obj(close); }
+#endif
+
+    /* Ask the card what is in the library; src_poll() fills the list when the
+     * answer comes. The window opens with whatever was last read. */
+    if (auto* st = tools()) {
+        if (auto* h = inst_host()) {
+            if (st->requestFolder(st->cardRoot() + h->libraryRoot())) s_srcListing = true;
+        }
+    }
+    src_fill();
+}
+
 // ── swing ──────────────────────────────────────────────────────────────────
 
 /* Swing is late, not moved: every second subdivision sounds a share of one
@@ -1148,12 +1564,18 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
     lv_obj_add_event_cb(s_grid, grid_draw_cb, LV_EVENT_DRAW_MAIN_END, nullptr);
 
     // -- transport --
+    /* Six at 48 rather than five at 58: 6*48 + 5*3 = 303 of the 310 a padded
+     * root leaves. SRC sits beside REC because it is the other half of the
+     * same question -- what a take is made of. */
     lv_obj_t* tr = make_row(s_root, 28);
-    s_recBtn  = make_button(tr, 58, 28, "REC", rec_cb);
-    s_dubBtn  = make_button(tr, 58, 28, "DUB", dub_cb);
-    s_playBtn = make_button(tr, 58, 28, LV_SYMBOL_PLAY, play_cb);
-    s_stopBtn = make_button(tr, 58, 28, LV_SYMBOL_STOP, stop_cb);
-    s_syncBtn = make_button(tr, 58, 28, "SYNC", sync_cb);
+    s_srcBtn  = make_button(tr, 48, 28, "KIT", src_cb);
+    s_srcLabel = lv_obj_get_child(s_srcBtn, 0);
+    s_recBtn  = make_button(tr, 48, 28, "REC", rec_cb);
+    s_dubBtn  = make_button(tr, 48, 28, "DUB", dub_cb);
+    s_playBtn = make_button(tr, 48, 28, LV_SYMBOL_PLAY, play_cb);
+    s_stopBtn = make_button(tr, 48, 28, LV_SYMBOL_STOP, stop_cb);
+    s_syncBtn = make_button(tr, 48, 28, "SYNC", sync_cb);
+    src_sync();
 
     sync_ui();
     s_drawn = pattern_shape();
@@ -1195,12 +1617,31 @@ void Sequencer_destroy(lv_obj_t* root)
      * erasing instead of playing. The loop itself keeps running, and so does
      * a bounce: it finishes on its own and lands in the song. */
     if (auto* sq = seq()) sq->setErasing(false);
+
+    /* The pads go back to the kit's. The engine too -- unless a bounce is
+     * still capturing them, which it does on its own after the screen is
+     * gone: reloading the kit under it would record the wrong instrument.
+     * It is then held until SRC is set back to KIT, or Pitch Play takes it. */
+    src_drop_pads();
+    if (s_src == Src::Inst && !s_bouncing) {
+        if (auto* h = inst_host()) h->release();
+        s_src = Src::Kit;
+        s_instPath.clear();
+        s_instName.clear();
+    }
+    s_instReady.store(false);
+    s_srcNote.clear();
+    s_srcListing = false;
+
 #ifdef SEQ_USE_ENCODER
+    if (s_srcGroup) { lv_group_delete(s_srcGroup); s_srcGroup = nullptr; }
     if (s_bounceGroup) { lv_group_delete(s_bounceGroup); s_bounceGroup = nullptr; }
     if (s_swingGroup) { lv_group_delete(s_swingGroup); s_swingGroup = nullptr; }
 #endif
     s_bounceBox = s_bounceText = s_bounceBar = s_bounceBtn = nullptr;
     s_swingBox = s_swingText = s_swingVal = s_swingBtn = nullptr;
+    s_srcBox = s_srcList = s_srcNoteLbl = s_srcOctLbl = s_srcBtn = s_srcLabel = nullptr;
+    s_srcMinus = s_srcPlus = s_srcClose = nullptr;
     for (auto& c : s_swingChip) c = nullptr;
     s_bouncing = false;
     s_root = s_grid = s_bpm = s_syncBtn = s_clickBtn = s_preBtn = s_barsLabel = nullptr;
