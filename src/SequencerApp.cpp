@@ -33,6 +33,7 @@
 #include "crosspad/event/IEventBus.hpp"
 #include "crosspad/instrument/IInstrumentHost.hpp"
 #include "crosspad/instrument/PitchedInstrument.hpp"
+#include "crosspad/music/MusicTheory.hpp"
 #include "crosspad/kit/IKitManager.hpp"
 #include "crosspad/kit/KitInfo.hpp"
 #include "crosspad/pad/IPadLogicHandler.hpp"
@@ -169,6 +170,9 @@ lv_obj_t* s_srcBox   = nullptr;         ///< the picker, over the screen
 lv_obj_t* s_srcList  = nullptr;         ///< the scrolling part of it
 lv_obj_t* s_srcNoteLbl = nullptr;       ///< a failure or "loading", under the list
 lv_obj_t* s_srcOctLbl  = nullptr;       ///< the base note
+lv_obj_t* s_srcChordLbl = nullptr;      ///< what a pad makes: one note, or a chord
+lv_obj_t* s_srcChordMinus = nullptr;
+lv_obj_t* s_srcChordPlus = nullptr;
 lv_obj_t* s_srcMinus = nullptr;         ///< the three below the list; the group
 lv_obj_t* s_srcPlus  = nullptr;         ///< is rebuilt around them on every
 lv_obj_t* s_srcClose = nullptr;         ///< fill, so they keep their order
@@ -216,7 +220,27 @@ bool running()
  * to make -- an app declaring one must not. */
 
 constexpr uint8_t kSeqPads = 16;
+constexpr int      kSeqChordMax = 6;    ///< the widest voicing MusicTheory builds
 constexpr const char* kSrcPadLogic = "SeqPitch";
+
+/* A pad plays a chord, not only its own note. The mapping is
+ * crosspad::MusicTheory's -- the same one Pitch Play plays through, so a
+ * triad here is the triad there -- over a chromatic scale rooted on the pad
+ * range's base: the Sequencer has an octave control and no key of its own,
+ * and inventing a second place to set one would be two to keep in step.
+ *
+ * In PSRAM: PlaySettings is ~150 bytes and this board boots with a couple of
+ * hundred to spare. */
+#ifdef ESP_PLATFORM
+  #include "esp_attr.h"
+  #define SEQ_SLOW_BSS EXT_RAM_BSS_ATTR
+#else
+  #define SEQ_SLOW_BSS
+#endif
+
+SEQ_SLOW_BSS crosspad::MusicTheory  s_mt;
+SEQ_SLOW_BSS crosspad::PlaySettings s_ps;
+SEQ_SLOW_BSS int s_chordIdx;            ///< 0 = one note, then the chord types and progressions
 
 enum class Src : uint8_t { Kit, Inst };
 
@@ -225,6 +249,28 @@ std::string s_instPath;                  ///< logical path of the chosen instrum
 std::string s_instName;                  ///< what SRC and the window show
 std::string s_srcNote;                   ///< a failure or a progress line, for the window
 uint8_t     s_base = 60;                 ///< C4: the 16 pads are 16 semitones up from here
+
+void seq_rebuild_pads()
+{
+    s_ps.rootNote   = (uint8_t)(s_base % 12);
+    s_ps.octave     = (int8_t)(s_base / 12 - 3);
+    s_ps.scaleIndex = 0;                 // chromatic: one pad, one semitone
+    s_ps.chordIndex = (uint8_t)s_chordIdx;
+    s_mt.rebuildPadMap(s_ps);
+}
+
+/// The notes a press on @p pad makes. At least one, at most kSeqChordMax.
+int seq_chord_of(uint8_t pad, uint8_t* out)
+{
+    if (pad >= kSeqPads) { out[0] = 0; return 1; }
+    int n = 0;
+    const int have = s_ps.padChordCount[pad];
+    for (int c = 0; c < have && c < kSeqChordMax; ++c) {
+        if (s_ps.padChordNotes[pad][c] != 0xFF) out[n++] = s_ps.padChordNotes[pad][c];
+    }
+    if (n == 0) out[n++] = s_ps.padMidiMap[pad];
+    return n;
+}
 std::atomic<bool> s_instReady{false};    ///< the bank is built and the pads may play it
 bool        s_padLogicPushed = false;
 
@@ -253,21 +299,30 @@ public:
         if (pad >= kSeqPads || !s_instReady.load()) return;
         auto* p = inst();
         if (!p) return;
-        const uint8_t note = (uint8_t)std::min(127, (int)s_base + pad);
-        note_[pad].store(note);
-        p->noteOn(note, vel ? vel : 1, pad);
+        /* Kept as struck, so a release stops those notes and not whatever the
+         * octave or the chord says by then. */
+        uint8_t notes[kSeqChordMax] = {};
+        const int n = seq_chord_of(pad, notes);
+        held_[pad].store((uint8_t)n);
+        for (int i = 0; i < n; ++i) {
+            note_[pad][i].store(notes[i]);
+            p->noteOn(notes[i], vel ? vel : 1, pad);
+        }
         pm.notifyNoteOn(pad, vel ? vel : 1, true);
     }
     void onPadRelease(crosspad::PadManager& pm, uint8_t pad) override
     {
         if (pad >= kSeqPads) return;
-        if (auto* p = inst()) p->noteOff(note_[pad].load());
+        auto* p = inst();
+        const int n = (int)held_[pad].exchange(0);
+        for (int i = 0; i < n; ++i) if (p) p->noteOff(note_[pad][i].load());
         pm.notifyNoteOff(pad, true);
     }
     void onPadPressure(crosspad::PadManager&, uint8_t, uint8_t) override {}
 
 private:
-    std::atomic<uint8_t> note_[kSeqPads] = {};
+    std::atomic<uint8_t> note_[kSeqPads][kSeqChordMax] = {};
+    std::atomic<uint8_t> held_[kSeqPads] = {};
 };
 std::shared_ptr<SeqPitchPadLogic> s_srcPadLogic;
 
@@ -997,8 +1052,8 @@ void src_close()
     s_srcGroup = nullptr;
 #endif
     lv_obj_delete_async(s_srcBox);
-    s_srcBox = s_srcList = s_srcNoteLbl = s_srcOctLbl = nullptr;
-    s_srcMinus = s_srcPlus = s_srcClose = nullptr;
+    s_srcBox = s_srcList = s_srcNoteLbl = s_srcOctLbl = s_srcChordLbl = nullptr;
+    s_srcMinus = s_srcPlus = s_srcClose = s_srcChordMinus = s_srcChordPlus = nullptr;
     sync_ui();
 }
 
@@ -1016,6 +1071,18 @@ void src_pick_cb(lv_event_t* e)
     src_to_inst(h->libraryRoot() + "/" + name + "/" + crosspad::IInstrumentHost::kFileName, name);
 }
 
+/// Steps the chord through MusicTheory's list: one note, the types, then the
+/// progressions. The map follows at once, so the next hit is the new chord.
+void src_chord_cb(lv_event_t* e)
+{
+    const int d = (int)(intptr_t)lv_event_get_user_data(e);
+    const int n = (int)s_mt.totalChordCount();
+    s_chordIdx = (s_chordIdx + n + d) % n;
+    seq_rebuild_pads();
+    if (auto* p = inst()) p->allNotesOff();
+    src_fill();
+}
+
 void src_oct_cb(lv_event_t* e)
 {
     const int d = (int)(intptr_t)lv_event_get_user_data(e);
@@ -1023,6 +1090,7 @@ void src_oct_cb(lv_event_t* e)
     /* Sixteen pads from the base, so the top one must still be a note. */
     if (base < 0 || base + (kSeqPads - 1) > 127) return;
     s_base = (uint8_t)base;
+    seq_rebuild_pads();
     if (auto* p = inst()) p->allNotesOff();
     src_fill();
 }
@@ -1079,11 +1147,12 @@ void src_fill()
 
     if (s_srcOctLbl) {
         char n0[8], n1[8], buf[32];
-        note_name(s_base, n0, sizeof(n0));
-        note_name(std::min(127, (int)s_base + kSeqPads - 1), n1, sizeof(n1));
+        note_name(s_ps.padMidiMap[0], n0, sizeof(n0));
+        note_name(s_ps.padMidiMap[kSeqPads - 1], n1, sizeof(n1));
         std::snprintf(buf, sizeof(buf), "%s - %s", n0, n1);
         set_text(s_srcOctLbl, buf);
     }
+    if (s_srcChordLbl) set_text(s_srcChordLbl, s_mt.chordName((uint8_t)s_chordIdx));
     if (s_srcNoteLbl) set_text(s_srcNoteLbl, s_srcNote.c_str());
 
 #ifdef SEQ_USE_ENCODER
@@ -1091,7 +1160,7 @@ void src_fill()
      * below it back behind them so turning the encoder still walks the
      * window top to bottom. */
     if (s_srcGroup) {
-        for (lv_obj_t* o : {s_srcMinus, s_srcPlus, s_srcClose}) {
+        for (lv_obj_t* o : {s_srcMinus, s_srcPlus, s_srcChordMinus, s_srcChordPlus, s_srcClose}) {
             if (!o) continue;
             lv_group_remove_obj(o);
             lv_group_add_obj(s_srcGroup, o);
@@ -1163,6 +1232,40 @@ void src_cb(lv_event_t*)
     lv_label_set_text(lv_obj_get_child(plus, 0), LV_SYMBOL_PLUS);
 #ifdef SEQ_USE_ENCODER
     if (s_srcGroup) { lv_group_add_obj(s_srcGroup, minus); lv_group_add_obj(s_srcGroup, plus); }
+#endif
+
+    /* What a pad makes: one note, a chord type, or a progression -- the same
+     * list Pitch Play offers, because it is the same engine underneath. */
+    lv_obj_t* chord = make_row(s_srcBox, 24);
+    lv_obj_t* cl = lv_label_create(chord);
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(cl, kDim, 0);
+    lv_label_set_text(cl, "Chord");
+    lv_obj_t* cminus = lv_button_create(chord);
+    lv_obj_set_size(cminus, 28, 22);
+    lv_obj_set_style_radius(cminus, 6, 0);
+    lv_obj_set_style_shadow_width(cminus, 0, 0);
+    lv_obj_set_style_bg_color(cminus, kPanel, 0);
+    s_srcChordMinus = cminus;
+    lv_obj_add_event_cb(cminus, src_chord_cb, LV_EVENT_CLICKED, (void*)(intptr_t)-1);
+    lv_obj_center(lv_label_create(cminus));
+    lv_label_set_text(lv_obj_get_child(cminus, 0), LV_SYMBOL_MINUS);
+    s_srcChordLbl = lv_label_create(chord);
+    lv_obj_set_flex_grow(s_srcChordLbl, 1);
+    lv_obj_set_style_text_align(s_srcChordLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_srcChordLbl, kAccent, 0);
+    lv_label_set_text(s_srcChordLbl, "");
+    lv_obj_t* cplus = lv_button_create(chord);
+    lv_obj_set_size(cplus, 28, 22);
+    lv_obj_set_style_radius(cplus, 6, 0);
+    lv_obj_set_style_shadow_width(cplus, 0, 0);
+    lv_obj_set_style_bg_color(cplus, kPanel, 0);
+    s_srcChordPlus = cplus;
+    lv_obj_add_event_cb(cplus, src_chord_cb, LV_EVENT_CLICKED, (void*)(intptr_t)1);
+    lv_obj_center(lv_label_create(cplus));
+    lv_label_set_text(lv_obj_get_child(cplus, 0), LV_SYMBOL_PLUS);
+#ifdef SEQ_USE_ENCODER
+    if (s_srcGroup) { lv_group_add_obj(s_srcGroup, cminus); lv_group_add_obj(s_srcGroup, cplus); }
 #endif
 
     s_srcNoteLbl = lv_label_create(s_srcBox);
@@ -1577,6 +1680,7 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
     s_syncBtn = make_button(tr, 48, 28, "SYNC", sync_cb);
     src_sync();
 
+    seq_rebuild_pads();
     sync_ui();
     s_drawn = pattern_shape();
     s_headX = -1;
@@ -1641,7 +1745,8 @@ void Sequencer_destroy(lv_obj_t* root)
     s_bounceBox = s_bounceText = s_bounceBar = s_bounceBtn = nullptr;
     s_swingBox = s_swingText = s_swingVal = s_swingBtn = nullptr;
     s_srcBox = s_srcList = s_srcNoteLbl = s_srcOctLbl = s_srcBtn = s_srcLabel = nullptr;
-    s_srcMinus = s_srcPlus = s_srcClose = nullptr;
+    s_srcChordLbl = nullptr;
+    s_srcMinus = s_srcPlus = s_srcClose = s_srcChordMinus = s_srcChordPlus = nullptr;
     for (auto& c : s_swingChip) c = nullptr;
     s_bouncing = false;
     s_root = s_grid = s_bpm = s_syncBtn = s_clickBtn = s_preBtn = s_barsLabel = nullptr;
