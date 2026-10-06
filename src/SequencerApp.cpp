@@ -145,13 +145,15 @@ bool      s_bouncing = false;
 uint32_t s_drawn = 0;
 int32_t  s_headX = -1;   // screen x of the playhead as drawn, -1 = none
 
+/* The swing window is on every platform; only its encoder group is not. */
+lv_obj_t*   s_swingBox  = nullptr;      ///< the swing window, over the screen
+lv_obj_t*   s_swingText = nullptr;      ///< what it is set to, in words
+lv_obj_t*   s_swingBtn  = nullptr;      ///< SWING on the top row
+
 #ifdef SEQ_USE_ENCODER
 lv_group_t* s_encGroup = nullptr;
 lv_group_t* s_prevEncGroup = nullptr;
 lv_group_t* s_bounceGroup = nullptr;
-lv_obj_t*   s_swingBox  = nullptr;      ///< the swing window, over the screen
-lv_obj_t*   s_swingText = nullptr;      ///< what it is set to, in words
-lv_obj_t*   s_swingBtn  = nullptr;      ///< SWING on the top row
 lv_group_t* s_swingGroup = nullptr;
 #endif
 
@@ -836,7 +838,8 @@ void swing_cb(lv_event_t*)
     lv_obj_set_width(s_swingText, LV_PCT(100));
     lv_label_set_text(s_swingText, "");
 
-    lv_obj_t* less = swing_button(s_swingBox, LV_SYMBOL_MINUS "  2 %", swing_step_cb, (void*)(intptr_t)-2);
+    [[maybe_unused]] lv_obj_t* less =   // focused for the encoder only
+        swing_button(s_swingBox, LV_SYMBOL_MINUS "  2 %", swing_step_cb, (void*)(intptr_t)-2);
     swing_button(s_swingBox, LV_SYMBOL_PLUS "  2 %", swing_step_cb, (void*)(intptr_t)2);
     char unit[20];
     lv_snprintf(unit, sizeof(unit), "Swing the 1/%u", (unsigned)(sq->getSwingPerBeat() * 4));
