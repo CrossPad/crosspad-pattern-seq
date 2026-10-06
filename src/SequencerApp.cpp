@@ -239,7 +239,13 @@ void grid_draw_cb(lv_event_t* e)
         const int32_t y = laneY(pad);
         const lv_color_t pc = kit ? lv_color_hex(kit->pads[pad].color) : kAccent;
         const lv_opa_t opa = (lv_opa_t)(110 + (vel > 127 ? 127 : vel) * 145 / 127);
-        fill(layer, x, y, x + noteW - 1, y + laneH - 2, pc, opa);
+        /* As long as the pad was held, never narrower than a tap. A note held
+         * over the loop end goes on from the start, where it is still sounding. */
+        const int32_t lenW = (int32_t)(sq->getSceneEventLength(scene, i) * gw);
+        const int32_t w = lenW > noteW ? lenW : noteW;
+        const int32_t over = x + w - (x0 + gw);
+        fill(layer, x, y, (over > 0 ? x0 + gw : x + w) - 1, y + laneH - 2, pc, opa);
+        if (over > 0) fill(layer, x0, y, x0 + over - 1, y + laneH - 2, pc, opa);
     }
 
     if (s_headX >= 0) fill(layer, s_headX, box.y1, s_headX + 1, box.y1 + laneH * kLanes - 1, kHead, LV_OPA_COVER);
@@ -271,8 +277,12 @@ uint32_t pattern_shape()
     auto* sq = seq();
     if (!sq) return 0;
     const uint8_t s = sq->getActiveScene();
+    const uint16_t n = sq->getSceneEventCount(s);
+    /* A release changes no count, only how long its note is drawn. */
+    float lens = 0.0f;
+    for (uint16_t i = 0; i < n; ++i) lens += sq->getSceneEventLength(s, i);
     return ((uint32_t)s << 24) ^ ((uint32_t)sq->getSceneBars(s) << 16) ^
-           sq->getSceneEventCount(s) ^ ((uint32_t)sq->getSceneCount() << 20);
+           n ^ ((uint32_t)sq->getSceneCount() << 20) ^ ((uint32_t)(lens * 65536.0f) << 1);
 }
 
 // ── state on the buttons ───────────────────────────────────────────────────
