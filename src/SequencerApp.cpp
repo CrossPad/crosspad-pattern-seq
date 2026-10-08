@@ -375,9 +375,17 @@ void grid_draw_cb(lv_event_t* e)
         uint8_t pad = 0, vel = 0;
         if (!sq->getSceneEvent(scene, i, at, pad, vel) || pad >= kLanes) continue;
         /* One colour, one size, like the export: the row says which pad, so
-         * the mark only has to say that a hit is there. */
+         * the mark only has to say that a hit is there. A note held longer
+         * trails a bar as long as it was held, round the loop end if it
+         * reaches past it. */
         const int32_t x = x0 + (int32_t)(at * gw);
         const int32_t y = laneY(pad) + (rowH - kNoteH) / 2;
+        const int32_t len = (int32_t)(sq->getSceneEventLength(scene, i) * gw);
+        if (len > kNoteW) {
+            const int32_t end = x + len;
+            fill(layer, x, y, std::min(end, x0 + gw) - 1, y + kNoteH - 1, kWave, LV_OPA_50);
+            if (end > x0 + gw) fill(layer, x0, y, x0 + (end - x0 - gw) - 1, y + kNoteH - 1, kWave, LV_OPA_50);
+        }
         fill(layer, x, y, x + kNoteW - 1, y + kNoteH - 1, kWave, LV_OPA_COVER);
     }
 
@@ -413,8 +421,12 @@ uint32_t pattern_shape()
     auto* sq = seq();
     if (!sq) return 0;
     const uint8_t s = sq->getActiveScene();
+    const uint16_t n = sq->getSceneEventCount(s);
+    /* A length lands at the release, after its note is already drawn. */
+    uint32_t held = 0;
+    for (uint16_t i = 0; i < n; ++i) held = held * 31u + (uint32_t)(sq->getSceneEventLength(s, i) * 65536.0f);
     return ((uint32_t)s << 24) ^ ((uint32_t)sq->getSceneBars(s) << 16) ^
-           sq->getSceneEventCount(s) ^ ((uint32_t)sq->getSceneCount() << 20);
+           n ^ ((uint32_t)sq->getSceneCount() << 20) ^ held;
 }
 
 // ── state on the buttons ───────────────────────────────────────────────────
@@ -601,13 +613,21 @@ void bpm_cb(lv_event_t* e)
     lv_obj_t* b = static_cast<lv_obj_t*>(lv_event_get_current_target(e));
     if (!sq || !b) return;
     lv_group_t* g = lv_obj_get_group(b);
-    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
         /* The encoder's second click, or a tap: leave edit mode, or enter it. */
         if (g) {
             const bool editing = lv_group_get_editing(g) && lv_group_get_focused(g) == b;
             lv_group_focus_obj(b);
             lv_group_set_editing(g, !editing);
         }
+        return;
+    }
+    if (code == LV_EVENT_FOCUSED || code == LV_EVENT_DEFOCUSED) {
+        /* Let go of (a click, a long press, focus moving on): the tempo is the
+         * instrument's, and the open song takes it now. Nothing to do when
+         * nothing was turned. */
+        if (!(g && lv_group_get_editing(g) && lv_group_get_focused(g) == b)) crosspad::transportCommitTempo();
         return;
     }
     const uint32_t key = lv_event_get_key(e);
@@ -618,7 +638,7 @@ void bpm_cb(lv_event_t* e)
     const int32_t v = std::max<int32_t>((int32_t)crosspad::SequencerLimits::MIN_BPM,
                       std::min<int32_t>((int32_t)crosspad::SequencerLimits::MAX_BPM,
                                         (int32_t)lroundf(sq->getBpm()) + step));
-    sq->setBpm((float)v);
+    crosspad::transportSetTempo((float)v);
     sync_ui();
 }
 
@@ -732,6 +752,15 @@ void arr_back_cb(lv_event_t*)
 
 /// EDIT: the sound this track's notes play through, in the app that makes it.
 /// The focus is kept, so that screen knows it was reached from a track.
+/// BOUNCE on a track: the question is asked over the arrangement it changes
+/// (UX 2000 section 7, screen 6), so Arrange is opened to ask it.
+void track_bounce_cb(lv_event_t*)
+{
+    if (!in_track()) return;
+    crosspad::arrangeFocus().bounce = true;
+    if (!crosspad_gui::mode_overlay_open_app("Arrange")) crosspad::arrangeFocus().clear();
+}
+
 void edit_src_cb(lv_event_t*)
 {
     if (!in_track()) return;
@@ -1596,6 +1625,8 @@ lv_obj_t* make_bpm(lv_obj_t* parent)
     lv_obj_center(l);
     lv_obj_add_event_cb(b, bpm_cb, LV_EVENT_KEY, nullptr);
     lv_obj_add_event_cb(b, bpm_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(b, bpm_cb, LV_EVENT_FOCUSED, nullptr);
+    lv_obj_add_event_cb(b, bpm_cb, LV_EVENT_DEFOCUSED, nullptr);
 #ifdef SEQ_USE_ENCODER
     if (s_encGroup) lv_group_add_obj(s_encGroup, b);
 #endif
@@ -1812,7 +1843,7 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
         lv_obj_set_style_text_color(lv_obj_get_child(s_editBtn, 0), kInk, 0);
         place(make_button(s_root, 30, 28, "x2", double_cb), 122, SEQ_Y(206));
         place(make_button(s_root, 30, 28, "/2", halve_cb), 156, SEQ_Y(206));
-        place(make_button(s_root, 62, 28, "BOUNCE", bounce_cb), 190, SEQ_Y(206));
+        place(make_button(s_root, 62, 28, "BOUNCE", track_bounce_cb), 190, SEQ_Y(206));
         s_eraseBtn = make_button(s_root, 58, 28, "ERASE", nullptr);
         place(s_eraseBtn, 256, SEQ_Y(206));
     } else {
@@ -1864,7 +1895,14 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
              * last -- the Arranger's song, which cannot record -- and REC and
              * DUB were greyed out here, so the screen that records was the one
              * screen that could not. */
-            crosspad::transportClaim(crosspad::sequencerTransport());
+            /* Opened from an Arrange track it records against the song:
+             * PLAY and REC play the arrangement with this scene laid on it,
+             * and a song already playing keeps playing into it -- the same
+             * playback, handed over. Opened on its own it is the pattern. */
+            auto* st = crosspad::sequencerTransport();
+            if (st) st->setFollowSong(in_track());
+            auto* se = songs();
+            crosspad::transportClaim(st, !(in_track() && se && se->playing()));
             if (s_timer) lv_timer_resume(s_timer);
 #ifdef SEQ_USE_ENCODER
             if (indev_encoderTop && s_encGroup) lv_indev_set_group(indev_encoderTop, s_encGroup);
