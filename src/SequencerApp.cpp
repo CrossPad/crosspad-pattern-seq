@@ -179,15 +179,12 @@ bool      s_bouncing = false;
 uint32_t s_drawn = 0;
 int32_t  s_headX = -1;   // screen x of the playhead as drawn, -1 = none
 
-#ifdef SEQ_USE_ENCODER
-lv_group_t* s_encGroup = nullptr;
-lv_group_t* s_prevEncGroup = nullptr;
-lv_group_t* s_bounceGroup = nullptr;
+/* The swing window is on every platform; only its encoder group is not. */
 lv_obj_t*   s_swingBox  = nullptr;      ///< the swing window, over the screen
 lv_obj_t*   s_swingText = nullptr;      ///< what it is set to, in words
+lv_obj_t*   s_swingBtn  = nullptr;      ///< SWING on the top row
 lv_obj_t*   s_swingVal  = nullptr;      ///< the amount, turned with the encoder
 lv_obj_t*   s_swingChip[7] = {};        ///< the sampler's steps, 50 to 75
-lv_obj_t*   s_swingBtn  = nullptr;      ///< SWING on the top row
 
 /* SRC: what the pads play, and the window that picks it. */
 lv_obj_t* s_srcBtn   = nullptr;         ///< SRC on the transport row
@@ -200,9 +197,14 @@ lv_obj_t* s_srcChordLbl = nullptr;      ///< what a pad makes: one note, or a ch
 lv_obj_t* s_srcClose = nullptr;         ///< below the list; the group is
                                         ///< rebuilt around it on every fill,
                                         ///< so it keeps its place in the order
-lv_group_t* s_srcGroup = nullptr;
 std::vector<std::string> s_srcLib;      ///< instrument folder names
 bool s_srcListing = false;              ///< a folder request of ours is out
+
+#ifdef SEQ_USE_ENCODER
+lv_group_t* s_encGroup = nullptr;
+lv_group_t* s_prevEncGroup = nullptr;
+lv_group_t* s_bounceGroup = nullptr;
+lv_group_t* s_srcGroup = nullptr;
 lv_group_t* s_swingGroup = nullptr;
 #endif
 
