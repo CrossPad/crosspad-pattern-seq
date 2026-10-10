@@ -29,13 +29,24 @@
 #endif
 
 #include "crosspad/app/AppRegistrar.hpp"
+#include "crosspad/instrument/InstrumentPadLogic.hpp"
+#include "crosspad/instrument/InstrumentPlayState.hpp"
 #include "crosspad/event/EventData.hpp"
 #include "crosspad/event/IEventBus.hpp"
+#include "crosspad/instrument/IInstrumentHost.hpp"
+#include "crosspad/music/MusicTheory.hpp"
 #include "crosspad/kit/IKitManager.hpp"
 #include "crosspad/kit/KitInfo.hpp"
+#include "crosspad/pad/IPadLogicHandler.hpp"
+#include "crosspad/pad/PadManager.hpp"
 #include "crosspad/platform/PlatformServices.hpp"
+#include "crosspad/sampletools/ISampleTools.hpp"
 #include "crosspad/sequencer/SequencerController.hpp"
+#include "crosspad/transport/SequencerTransport.hpp"
+#include "crosspad/song/ArrangeFocus.hpp"
 #include "crosspad/song/ISongEngine.hpp"
+#include "crosspad-gui/components/mode_overlay.h"
+#include "crosspad-gui/components/transport_bar.h"
 #include "crosspad-gui/widgets/gui_helpers.h"
 
 #include "lvgl.h"
@@ -48,8 +59,10 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 // Encoder navigation is an embedded-only concern -- the simulator drives the UI
 // with a pointer. Snapshot whichever group was active before the app opened and
@@ -105,6 +118,13 @@ const lv_color_t kAccent = lv_color_hex(0xC6FF47);
 const lv_color_t kRec    = lv_color_hex(0xFF5C5C);
 const lv_color_t kPlay   = lv_color_hex(0x4FE0B0);
 const lv_color_t kAmber  = lv_color_hex(0xFFC857);
+const lv_color_t kGridBg = lv_color_hex(0x1B1E22);   ///< darker than a button
+const lv_color_t kWave   = lv_color_hex(0x9CD639);   ///< a note, the export's one colour
+const lv_color_t kPlayhead = lv_color_hex(0x00FF88); ///< mint, like the transport bar at rest
+constexpr int32_t kGridInset = 6;                    ///< the export's first line, inside the panel
+constexpr int32_t kNoteW = 5;                        ///< the export's mark
+constexpr int32_t kNoteH = 6;
+constexpr int32_t kMinStepPx = 6;                    ///< below this a step grid is a smear
 const lv_color_t kHead   = lv_color_hex(0xFFFFFF);
 /// The tempo field while a host's MIDI clock drives the tempo.
 const lv_color_t kHostClock = lv_color_hex(0x4FC3F7);
@@ -115,10 +135,24 @@ lv_obj_t* s_bpm = nullptr;
 lv_obj_t* s_syncBtn = nullptr;
 lv_obj_t* s_clickBtn = nullptr;
 lv_obj_t* s_preBtn = nullptr;
+/* The two keys this screen grows when Arrange sent it: the way back to the
+ * arrangement, and the way into the sound the track plays. They stand where
+ * M and PRE do -- those belong to a groove played on its own, and in a track's
+ * context this screen is one track of a song. */
+lv_obj_t* s_arrBtn = nullptr;
+lv_obj_t* s_editBtn = nullptr;
 lv_obj_t* s_barsLabel = nullptr;
 lv_obj_t* s_quantBtn = nullptr;
 lv_obj_t* s_quantLabel = nullptr;
 lv_obj_t* s_sceneLabel = nullptr;
+/* The scene name is a button: the design's two rows are full to 314 px and
+ * the screen it was drawn for had fewer controls than this one, so the four
+ * that no longer fit -- the tempo, ADD, DEL, SRC and SYNC -- live behind it.
+ * A window for a set of settings is this screen's own idiom already (SWING,
+ * BOUNCE), so it is not a new one to learn. */
+lv_obj_t* s_sceneBtn = nullptr;
+lv_obj_t* s_sceneMenu = nullptr;
+lv_group_t* s_sceneGroup = nullptr;
 lv_obj_t* s_eraseBtn = nullptr;
 lv_obj_t* s_recBtn = nullptr;
 lv_obj_t* s_dubBtn = nullptr;
@@ -149,11 +183,28 @@ int32_t  s_headX = -1;   // screen x of the playhead as drawn, -1 = none
 lv_obj_t*   s_swingBox  = nullptr;      ///< the swing window, over the screen
 lv_obj_t*   s_swingText = nullptr;      ///< what it is set to, in words
 lv_obj_t*   s_swingBtn  = nullptr;      ///< SWING on the top row
+lv_obj_t*   s_swingVal  = nullptr;      ///< the amount, turned with the encoder
+lv_obj_t*   s_swingChip[7] = {};        ///< the sampler's steps, 50 to 75
+
+/* SRC: what the pads play, and the window that picks it. */
+lv_obj_t* s_srcBtn   = nullptr;         ///< SRC on the transport row
+lv_obj_t* s_srcLabel = nullptr;         ///< its text: KIT, or the instrument
+lv_obj_t* s_srcBox   = nullptr;         ///< the picker, over the screen
+lv_obj_t* s_srcList  = nullptr;         ///< the scrolling part of it
+lv_obj_t* s_srcNoteLbl = nullptr;       ///< a failure or "loading", under the list
+lv_obj_t* s_srcOctLbl  = nullptr;       ///< the base note
+lv_obj_t* s_srcChordLbl = nullptr;      ///< what a pad makes: one note, or a chord
+lv_obj_t* s_srcClose = nullptr;         ///< below the list; the group is
+                                        ///< rebuilt around it on every fill,
+                                        ///< so it keeps its place in the order
+std::vector<std::string> s_srcLib;      ///< instrument folder names
+bool s_srcListing = false;              ///< a folder request of ours is out
 
 #ifdef SEQ_USE_ENCODER
 lv_group_t* s_encGroup = nullptr;
 lv_group_t* s_prevEncGroup = nullptr;
 lv_group_t* s_bounceGroup = nullptr;
+lv_group_t* s_srcGroup = nullptr;
 lv_group_t* s_swingGroup = nullptr;
 #endif
 
@@ -162,17 +213,95 @@ crosspad::SequencerController* seq()
     return crosspad::getPlatformServices().sequencer;
 }
 
-crosspad::KitInfo* current_kit()
-{
-    auto* km = crosspad::getKitManager();
-    return km ? km->getCurrentKit() : nullptr;
-}
-
 bool running()
 {
     auto* sq = seq();
     return sq && sq->getState() == crosspad::SequencerState::Running;
 }
+
+// ── what the pads play, and so what a take records ─────────────────────────
+
+/* The Sequencer has no sound of its own: it records whatever the pads make,
+ * and a bounce captures the pads bus (SongEngine::runBounce), so whichever of
+ * these is playing is what lands on the track. Until now that was always the
+ * kit. SRC also offers the instruments Pitch Play saves, so a melodic part can
+ * be recorded and bounced here rather than played by hand into the Sampler.
+ *
+ * The pitched engine and the kits' streamer share one arena, so an instrument
+ * is *borrowed* through IInstrumentHost: taking it stops the kits' engine,
+ * giving it back reloads the kit. Hence release() on the way out -- leave it
+ * borrowed and the Sampler comes back silent. The one exception is a bounce
+ * still running when the screen closes: it is capturing the pads, so the
+ * engine has to stay until it is done.
+ *
+ * The pads need a logic of their own in this mode (the Sampler's plays kit
+ * pads, not notes), pushed on the way in and popped on the way out. This app
+ * registers with plain REGISTER_APP and no padLogicName, so the push is ours
+ * to make -- an app declaring one must not. */
+
+constexpr uint8_t kSeqPads = 16;
+constexpr int      kSeqChordMax = 6;    ///< the widest voicing MusicTheory builds
+constexpr const char* kSrcPadLogic = "SeqPitch";
+
+/* A pad plays a chord, not only its own note. The mapping is
+ * crosspad::MusicTheory's -- the same one Pitch Play plays through, so a
+ * triad here is the triad there -- over a chromatic scale rooted on the pad
+ * range's base: the Sequencer has an octave control and no key of its own,
+ * and inventing a second place to set one would be two to keep in step.
+ *
+ * In PSRAM: PlaySettings is ~150 bytes and this board boots with a couple of
+ * hundred to spare. */
+#ifdef ESP_PLATFORM
+  #include "esp_attr.h"
+  #define SEQ_SLOW_BSS EXT_RAM_BSS_ATTR
+#else
+  #define SEQ_SLOW_BSS
+#endif
+
+SEQ_SLOW_BSS crosspad::PlaySettings s_ps;
+
+enum class Src : uint8_t { Kit, Inst };
+
+Src         s_src = Src::Kit;
+std::string s_instPath;                  ///< logical path of the chosen instrument
+std::string s_instName;                  ///< what SRC and the window show
+std::string s_srcNote;                   ///< a failure or a progress line, for the window
+uint32_t    s_playGen = 0;               ///< InstrumentPlayState::generation last copied
+
+/* Pitch Play's map, not one of our own.
+ *
+ * The instrument source *is* Pitch Play's instrument, so a pad here has to
+ * make the note Pitch Play says it makes -- its key, scale, transpose and
+ * chord included. This used to build a chromatic map from a base note of its
+ * own with its own chord index, which meant the same pattern sounded one way
+ * under the pads and another way recorded, and two places to set the same
+ * thing. Both are gone: core's InstrumentPlayState carries a padMidiMap and
+ * padChordNotes that MusicTheory::rebuildPadMap() has already filled, and
+ * this copies them.
+ *
+ * Copied rather than read through: onPadPress runs on the pad task and the
+ * publisher is the UI thread, so a snapshot taken here, on the app tick, is
+ * what the pads read. */
+void seq_rebuild_pads()
+{
+    s_ps = crosspad::instrumentPlayState().play;
+    s_playGen = crosspad::instrumentPlayState().generation;
+}
+
+std::atomic<bool> s_instReady{false};    ///< the bank is built and the pads may play it
+bool        s_padLogicPushed = false;
+
+crosspad::IInstrumentHost*   inst_host() { return crosspad::getPlatformServices().instrumentHost; }
+crosspad::ISampleTools*      tools()     { return crosspad::getPlatformServices().sampleTools; }
+
+void note_name(int note, char* buf, size_t n)
+{
+    static const char* kNames[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+    if (note < 0 || note > 127) { std::snprintf(buf, n, "--"); return; }
+    std::snprintf(buf, n, "%s%d", kNames[note % 12], note / 12 - 1);
+}
+
+std::shared_ptr<crosspad::InstrumentPadLogic> s_srcPadLogic;   // core owns the behaviour
 
 // ── pattern grid ───────────────────────────────────────────────────────────
 
@@ -188,9 +317,16 @@ void fill(lv_layer_t* layer, int32_t x1, int32_t y1, int32_t x2, int32_t y2,
     lv_draw_rect(layer, &d, &a);
 }
 
-/// Drawn straight into the layer rather than built from objects: a full scene
-/// is 192 notes, and 192 LVGL objects rebuilt on every hit would cost more
-/// than the pattern is worth.
+/// The V5 grid, drawn straight into the layer rather than built from objects.
+///
+/// The export lays out 12 rows x 16 boxes plus 17 line objects -- 209 LVGL
+/// objects, tens of kB of the PSRAM the UI lives in on this board, rebuilt on
+/// every hit. The look is the export's to the pixel; the way it gets on
+/// screen is not, and nothing about that is visible.
+///
+/// Sixteen lanes, not the mockup's twelve: there are sixteen pads, and four
+/// of them would have nowhere to show. ROWH follows from that -- 134 px of
+/// grid over 16 lanes is 8, where the export's 12 lanes took 10.
 void grid_draw_cb(lv_event_t* e)
 {
     auto* sq = seq();
@@ -202,55 +338,63 @@ void grid_draw_cb(lv_event_t* e)
     lv_obj_get_content_coords(obj, &box);
     const int32_t w = lv_area_get_width(&box);
     const int32_t h = lv_area_get_height(&box);
-    const int32_t laneH = h / kLanes;
-    const int32_t x0 = box.x1 + 4;          // after the pad-colour strip
-    const int32_t gw = w - 4;
-    if (laneH < 2 || gw < 16) return;
+    if (w < 32 || h < 16) return;
 
     const uint8_t scene = sq->getActiveScene();
-    const int bars = sq->getSceneBars(scene) ? sq->getSceneBars(scene) : 1;
+    const int bars  = sq->getSceneBars(scene) ? sq->getSceneBars(scene) : 1;
     const int beats = bars * 4;
-    crosspad::KitInfo* kit = current_kit();
 
-    /* Lanes: the pad's own colour as a strip at the left edge, so a note's
-     * colour can be matched to its row without a label. Pad 1 at the bottom,
-     * the way the pads sit under your hand. */
-    auto laneY = [&](int pad) { return box.y1 + (kLanes - 1 - pad) * laneH; };
-    for (int p = 0; p < kLanes; ++p) {
-        const int32_t y = laneY(p);
-        const lv_color_t pc = kit ? lv_color_hex(kit->pads[p].color) : kDim;
-        fill(layer, box.x1, y, box.x1 + 2, y + laneH - 2, pc, LV_OPA_COVER);
-        if (p % 4 == 0 && p > 0) {      // under a row of four: the line to the row below
-            fill(layer, x0, y + laneH - 1, x0 + gw - 1, y + laneH - 1, kLine, LV_OPA_COVER);
-        }
-    }
-    /* Beats faint, bars strong: the grid a take is snapped to. */
-    for (int b = 0; b <= beats; ++b) {
-        const int32_t x = x0 + (int32_t)((int64_t)gw * b / beats);
-        fill(layer, x, box.y1, x, box.y1 + laneH * kLanes - 1,
-             b % 4 == 0 ? kBarLn : kLine, LV_OPA_COVER);
+    /* The export's own geometry: the first line 6 px inside the grid, and a
+     * step every 18.5 px. It drew 16 steps of a bar; a scene here can be up
+     * to eight bars, so the step is the scene's beat and the division stays
+     * the export's -- strong on the bar, hairline between. */
+    const int32_t x0 = box.x1 + kGridInset;
+    const int32_t gw = w - kGridInset * 2;
+    const int32_t rowH = h / kLanes;
+    if (rowH < 3 || gw < 16) return;
+
+    /* A line per step, strong every fourth, exactly as the export draws it --
+     * at one bar that is its sixteen steps and seventeen lines. A longer
+     * scene would put them 4 px apart and the grid would read as a smear, so
+     * below kMinStepPx the division falls back to the beat. */
+    int divs = beats * 4;
+    if (divs > 0 && gw / divs < kMinStepPx) divs = beats;
+    if (divs < 1) divs = 1;
+    const int strongEvery = (divs == beats) ? 4 : 4;   // a bar, or a beat
+    for (int b = 0; b <= divs; ++b) {
+        const int32_t x = x0 + (int32_t)((int64_t)gw * b / divs);
+        const bool strong = (b % strongEvery) == 0;
+        fill(layer, x, box.y1, x + (strong ? 1 : 0), box.y1 + h - 1,
+             kLine, strong ? LV_OPA_COVER : 150);
     }
 
-    const int32_t noteW = gw / (beats * 4) > 2 ? gw / (beats * 4) - 1 : 2;
+    /* Pad 1 at the bottom, the way the pads sit under your hand. */
+    auto laneY = [&](int pad) { return box.y1 + (kLanes - 1 - pad) * rowH; };
+
     const uint16_t n = sq->getSceneEventCount(scene);
     for (uint16_t i = 0; i < n; ++i) {
         float at = 0.0f;
         uint8_t pad = 0, vel = 0;
         if (!sq->getSceneEvent(scene, i, at, pad, vel) || pad >= kLanes) continue;
+        /* One colour, one size, like the export: the row says which pad, so
+         * the mark only has to say that a hit is there. A note held longer
+         * trails a bar as long as it was held, round the loop end if it
+         * reaches past it. */
         const int32_t x = x0 + (int32_t)(at * gw);
-        const int32_t y = laneY(pad);
-        const lv_color_t pc = kit ? lv_color_hex(kit->pads[pad].color) : kAccent;
-        const lv_opa_t opa = (lv_opa_t)(110 + (vel > 127 ? 127 : vel) * 145 / 127);
-        /* As long as the pad was held, never narrower than a tap. A note held
-         * over the loop end goes on from the start, where it is still sounding. */
-        const int32_t lenW = (int32_t)(sq->getSceneEventLength(scene, i) * gw);
-        const int32_t w = lenW > noteW ? lenW : noteW;
-        const int32_t over = x + w - (x0 + gw);
-        fill(layer, x, y, (over > 0 ? x0 + gw : x + w) - 1, y + laneH - 2, pc, opa);
-        if (over > 0) fill(layer, x0, y, x0 + over - 1, y + laneH - 2, pc, opa);
+        const int32_t y = laneY(pad) + (rowH - kNoteH) / 2;
+        const int32_t len = (int32_t)(sq->getSceneEventLength(scene, i) * gw);
+        if (len > kNoteW) {
+            const int32_t end = x + len;
+            fill(layer, x, y, std::min(end, x0 + gw) - 1, y + kNoteH - 1, kWave, LV_OPA_50);
+            if (end > x0 + gw) fill(layer, x0, y, x0 + (end - x0 - gw) - 1, y + kNoteH - 1, kWave, LV_OPA_50);
+        }
+        fill(layer, x, y, x + kNoteW - 1, y + kNoteH - 1, kWave, LV_OPA_COVER);
     }
 
-    if (s_headX >= 0) fill(layer, s_headX, box.y1, s_headX + 1, box.y1 + laneH * kLanes - 1, kHead, LV_OPA_COVER);
+    if (s_headX >= 0) {
+        fill(layer, s_headX, box.y1, s_headX + 1, box.y1 + h - 1,
+             kPlayhead, LV_OPA_COVER);
+    }
 }
 
 /// Where the playhead belongs now, in screen x; -1 when stopped.
@@ -280,11 +424,11 @@ uint32_t pattern_shape()
     if (!sq) return 0;
     const uint8_t s = sq->getActiveScene();
     const uint16_t n = sq->getSceneEventCount(s);
-    /* A release changes no count, only how long its note is drawn. */
-    float lens = 0.0f;
-    for (uint16_t i = 0; i < n; ++i) lens += sq->getSceneEventLength(s, i);
+    /* A length lands at the release, after its note is already drawn. */
+    uint32_t held = 0;
+    for (uint16_t i = 0; i < n; ++i) held = held * 31u + (uint32_t)(sq->getSceneEventLength(s, i) * 65536.0f);
     return ((uint32_t)s << 24) ^ ((uint32_t)sq->getSceneBars(s) << 16) ^
-           n ^ ((uint32_t)sq->getSceneCount() << 20) ^ ((uint32_t)(lens * 65536.0f) << 1);
+           n ^ ((uint32_t)sq->getSceneCount() << 20) ^ held;
 }
 
 // ── state on the buttons ───────────────────────────────────────────────────
@@ -304,6 +448,25 @@ void set_text(lv_obj_t* l, const char* text)
 {
     if (l && std::strcmp(lv_label_get_text(l), text) != 0) lv_label_set_text(l, text);
 }
+
+/* ── an Arrange track's seq: is this screen one, and in what colour ───────
+ * Opened from Arrange, this screen is one track of a song; opened on its own
+ * it is the groove sequencer it has always been. The actions that go with it
+ * are further down, by scene_step(). */
+bool in_track()
+{
+    const crosspad::ArrangeFocus& f = crosspad::arrangeFocus();
+    return f.held() && f.seq;
+}
+
+lv_color_t track_ink()
+{
+    return crosspad::arrangeFocus().source == crosspad::SeqSource::Pitch
+        ? lv_color_hex(0xA77BF0)      // Pitch Play's purple
+        : kAmber;                     // the Sampler's amber
+}
+
+crosspad::ISongEngine* songs();
 
 void sync_ui()
 {
@@ -328,17 +491,21 @@ void sync_ui()
         std::snprintf(buf, sizeof(buf), "%u", (unsigned)left);
         set_text(lv_obj_get_child(waiting, 0), buf);
     }
-    if (waiting != s_recBtn) set_text(lv_obj_get_child(s_recBtn, 0), "REC");
-    if (waiting != s_dubBtn) set_text(lv_obj_get_child(s_dubBtn, 0), "DUB");
+    /* REC and DUB moved to the transport bar, so these are null here now and
+     * only the count-in above still writes to one when a screen has them. */
+    if (s_recBtn && waiting != s_recBtn) set_text(lv_obj_get_child(s_recBtn, 0), "REC");
+    if (s_dubBtn && waiting != s_dubBtn) set_text(lv_obj_get_child(s_dubBtn, 0), "DUB");
     paint(s_preBtn, sq->getCountIn() ? kAmber : kPanel, sq->getCountIn());
     /* The amount on the button: a feel you cannot see the value of is one you
      * cannot put back where it was. */
     if (s_swingBtn) {
         const uint8_t sw = sq->getSwing();
         paint(s_swingBtn, sw ? kAmber : kPanel, sw != 0);
-        char sb[12];
-        if (sw) std::snprintf(sb, sizeof(sb), "SW %u", (unsigned)sw);
-        else    std::snprintf(sb, sizeof(sb), "SWING");
+        /* The amount always on the key, the way the export writes it: 78 px
+         * holds "SWING 100%" in font 10, and a feel you cannot see the value
+         * of is one you cannot put back where it was. */
+        char sb[16];
+        std::snprintf(sb, sizeof(sb), "SWING %u%%", (unsigned)sw);
         set_text(lv_obj_get_child(s_swingBtn, 0), sb);
     }
     paint(s_playBtn, (run && !rec && !dub) ? kPlay : kPanel, run && !rec && !dub);
@@ -374,16 +541,35 @@ void sync_ui()
     std::snprintf(buf, sizeof(buf), "%ub", (unsigned)bars);
     set_text(s_barsLabel, buf);
 
+    /* In an Arrange track's context the name is the track, because that is
+     * what the player is working on -- which scene it plays is the track's
+     * business and shows in Arrange's lane. The colour is the sound it plays
+     * through, the same amber or purple the track's badge carries there. */
+    if (in_track()) {
+        std::snprintf(buf, sizeof(buf), "T%u SEQ", (unsigned)(crosspad::arrangeFocus().track + 1));
+        set_text(s_sceneLabel, buf);
+        const lv_color_t ink = track_ink();
+        if (!lv_color_eq(lv_obj_get_style_text_color(s_sceneLabel, LV_PART_MAIN), ink)) {
+            lv_obj_set_style_text_color(s_sceneLabel, ink, 0);
+        }
+    } else
     /* The scene you asked for, amber until the loop end hands it over. */
     if (pending != active) {
-        std::snprintf(buf, sizeof(buf), "Seq %u > %u", (unsigned)(active + 1), (unsigned)(pending + 1));
+        /* No spaces around the separators, as the design writes it. It also
+         * bounds the label: eight scenes is the most there can be, so the
+         * widest this gets is "Seq 8>8" -- seven characters, which montserrat
+         * 14 draws in about 49 px of the 56 the design gives the name. With
+         * the spaces it was nine and overflowed the chip into the arrows. */
+        std::snprintf(buf, sizeof(buf), "Seq %u>%u", (unsigned)(active + 1), (unsigned)(pending + 1));
     } else {
-        std::snprintf(buf, sizeof(buf), "Seq %u / %u", (unsigned)(active + 1), (unsigned)sq->getSceneCount());
+        std::snprintf(buf, sizeof(buf), "Seq %u/%u", (unsigned)(active + 1), (unsigned)sq->getSceneCount());
     }
-    set_text(s_sceneLabel, buf);
-    const lv_color_t sceneInk = pending != active ? kAmber : kText;
-    if (!lv_color_eq(lv_obj_get_style_text_color(s_sceneLabel, LV_PART_MAIN), sceneInk)) {
-        lv_obj_set_style_text_color(s_sceneLabel, sceneInk, 0);
+    if (!in_track()) {
+        set_text(s_sceneLabel, buf);
+        const lv_color_t sceneInk = pending != active ? kAmber : kText;
+        if (!lv_color_eq(lv_obj_get_style_text_color(s_sceneLabel, LV_PART_MAIN), sceneInk)) {
+            lv_obj_set_style_text_color(s_sceneLabel, sceneInk, 0);
+        }
     }
 
     if (s_bpm) {
@@ -398,10 +584,12 @@ void sync_ui()
 }
 
 void bounce_progress();
+void src_poll();
 
 void tick_cb(lv_timer_t*)
 {
     if (s_bouncing) bounce_progress();
+    src_poll();
     sync_ui();
     const uint32_t shape = pattern_shape();
     const int32_t x = head_x();
@@ -418,12 +606,6 @@ void tick_cb(lv_timer_t*)
 
 // ── actions ────────────────────────────────────────────────────────────────
 
-void back_cb(lv_event_t* e)
-{
-    auto* app = static_cast<App*>(lv_event_get_user_data(e));
-    if (app) app->destroyAppAsync();
-}
-
 /// The tempo goes to the clock at once -- the pattern is rescaled with it, so
 /// a take keeps its place in the bar -- and sequences.json carries it with
 /// the scenes. It is the groove's, not the kit's: another kit plays it as is.
@@ -433,13 +615,21 @@ void bpm_cb(lv_event_t* e)
     lv_obj_t* b = static_cast<lv_obj_t*>(lv_event_get_current_target(e));
     if (!sq || !b) return;
     lv_group_t* g = lv_obj_get_group(b);
-    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
         /* The encoder's second click, or a tap: leave edit mode, or enter it. */
         if (g) {
             const bool editing = lv_group_get_editing(g) && lv_group_get_focused(g) == b;
             lv_group_focus_obj(b);
             lv_group_set_editing(g, !editing);
         }
+        return;
+    }
+    if (code == LV_EVENT_FOCUSED || code == LV_EVENT_DEFOCUSED) {
+        /* Let go of (a click, a long press, focus moving on): the tempo is the
+         * instrument's, and the open song takes it now. Nothing to do when
+         * nothing was turned. */
+        if (!(g && lv_group_get_editing(g) && lv_group_get_focused(g) == b)) crosspad::transportCommitTempo();
         return;
     }
     const uint32_t key = lv_event_get_key(e);
@@ -450,7 +640,7 @@ void bpm_cb(lv_event_t* e)
     const int32_t v = std::max<int32_t>((int32_t)crosspad::SequencerLimits::MIN_BPM,
                       std::min<int32_t>((int32_t)crosspad::SequencerLimits::MAX_BPM,
                                         (int32_t)lroundf(sq->getBpm()) + step));
-    sq->setBpm((float)v);
+    crosspad::transportSetTempo((float)v);
     sync_ui();
 }
 
@@ -478,6 +668,29 @@ void bars_cb(lv_event_t*)
     sync_ui();
 }
 
+/* The design gives the length a - and a + of its own beside the readout,
+ * which beats one button that cycles 1-2-4-8 and wraps: a shorter scene is
+ * one press back, not three forward. */
+void len_dn_cb(lv_event_t*)
+{
+    auto* sq = seq();
+    if (!sq) return;
+    const uint8_t sc = sq->getActiveScene();
+    const uint8_t bars = sq->getSceneBars(sc);
+    if (bars > 1) sq->setSceneBars(sc, (uint8_t)(bars / 2));
+    sync_ui();
+}
+
+void len_up_cb(lv_event_t*)
+{
+    auto* sq = seq();
+    if (!sq) return;
+    const uint8_t sc = sq->getActiveScene();
+    const uint8_t bars = sq->getSceneBars(sc);
+    if (bars < 8) sq->setSceneBars(sc, (uint8_t)(bars ? bars * 2 : 1));
+    sync_ui();
+}
+
 /// 1/4, 1/8, 1/8T, 1/16, 1/16T, 1/32, free, and round again. The triplets sit
 /// where they belong by density -- three to the beat is between two and four --
 /// so one way round the button is coarse to fine and nothing jumps back. Free
@@ -501,13 +714,71 @@ void quant_cb(lv_event_t*)
 void double_cb(lv_event_t*) { if (auto* sq = seq()) sq->doubleScene(sq->getActiveScene()); sync_ui(); }
 void halve_cb(lv_event_t*)  { if (auto* sq = seq()) sq->halveScene(sq->getActiveScene()); sync_ui(); }
 
+/* ── an Arrange track's seq ────────────────────────────────────────────────
+ * Opened from Arrange (its SEQ card, or EDIT on a seq track), this screen is
+ * one track of a song: the name says which track, the first two keys are the
+ * way back to the arrangement and the way into the sound it plays, and the
+ * scene shown is the one that track plays -- so stepping the scene re-points
+ * the track rather than leaving it playing something that is not on screen.
+ *
+ * With nothing handed over, none of this applies and the screen is the groove
+ * sequencer it has always been. */
+/// The track now plays @p scene. Kept in the song, because that is where the
+/// arrangement reads it from when it draws the lane and when it bounces.
+void track_follow_scene(uint8_t scene)
+{
+    if (!in_track()) return;
+    auto* se = songs();
+    if (!se) return;
+    const int track = crosspad::arrangeFocus().track;
+    {
+        std::lock_guard<std::recursive_mutex> l(se->songMutex());
+        auto& t = se->song().tracks[track];
+        if (!t.inUse || t.kind != crosspad::TrackKind::Seq || t.scene == scene) return;
+        t.scene = scene;
+    }
+    crosspad::arrangeFocus().scene = scene;
+    se->commit();
+}
+
+/// Back to the arrangement. The track is left as it is -- its notes are in
+/// the scene, which is where they live -- and nothing is handed over any
+/// more, so the sequencer opened on its own next time is itself again.
+void arr_back_cb(lv_event_t*)
+{
+    crosspad::arrangeFocus().clear();
+    /* No Arrange in this firmware: the bar is refreshed anyway, so the keys
+     * paint from a transport that nobody handed over. */
+    if (!crosspad_gui::mode_overlay_open_app("Arrange")) crosspad_gui::transportbar_refresh();
+}
+
+/// EDIT: the sound this track's notes play through, in the app that makes it.
+/// The focus is kept, so that screen knows it was reached from a track.
+/// BOUNCE on a track: the question is asked over the arrangement it changes
+/// (UX 2000 section 7, screen 6), so Arrange is opened to ask it.
+void track_bounce_cb(lv_event_t*)
+{
+    if (!in_track()) return;
+    crosspad::arrangeFocus().bounce = true;
+    if (!crosspad_gui::mode_overlay_open_app("Arrange")) crosspad::arrangeFocus().clear();
+}
+
+void edit_src_cb(lv_event_t*)
+{
+    if (!in_track()) return;
+    const bool pitch = crosspad::arrangeFocus().source == crosspad::SeqSource::Pitch;
+    crosspad_gui::mode_overlay_open_app(pitch ? "PitchPlay" : "Sampler");
+}
+
 void scene_step(int d)
 {
     auto* sq = seq();
     if (!sq) return;
     const uint8_t n = sq->getSceneCount();
     if (!n) return;
-    sq->selectScene((uint8_t)((sq->getPendingScene() + n + d) % n));
+    const uint8_t next = (uint8_t)((sq->getPendingScene() + n + d) % n);
+    sq->selectScene(next);
+    track_follow_scene(next);
     sync_ui();
 }
 void scene_prev_cb(lv_event_t*) { scene_step(-1); }
@@ -533,15 +804,6 @@ void erase_cb(lv_event_t* e)
 
 crosspad::ISongEngine* songs() { return crosspad::getPlatformServices().songEngine; }
 
-/// SYNC on and a song to play: the transport starts the song, and the song
-/// starts the sequencer with it (Arrange's SYNC is the same switch).
-bool song_sync()
-{
-    auto* se = songs();
-    if (!se) return false;
-    std::lock_guard<std::recursive_mutex> l(se->songMutex());
-    return se->song().syncSeq && se->song().playEnd() > 0;
-}
 
 void sync_cb(lv_event_t*)
 {
@@ -555,54 +817,13 @@ void sync_cb(lv_event_t*)
     sync_ui();
 }
 
-/// From a stop, in sync: the song from its top, the sequencer doing @p take.
-///
-/// PRE counts here exactly as it does without the song. The count-in belongs to
-/// the take, and in sync it is the metronome that plays it -- the song and the
-/// scene both start on the sample after the last click. Until this asked for it
-/// the switch quietly dropped PRE: a take started from here goes in through the
-/// song's transport, and only a take started on its own ever read the sequencer
-/// and counted. Plain PLAY is still immediate, with the song or without it,
-/// which is what PRE has always meant on this screen.
-bool start_with_song(crosspad::SyncTake take)
-{
-    auto* se = songs();
-    if (!se || running() || !song_sync()) return false;
-    auto* sq = seq();
-    const uint8_t beats = (take != crosspad::SyncTake::None && sq) ? sq->getCountInBeats() : 0;
-    return beats ? se->playCountedIn(0, take, beats) : se->playWithTake(0, take);
-}
 
-/// A second REC closes the take without stopping the loop, which is what you
-/// want after playing the part in.
-void rec_cb(lv_event_t*)
-{
-    auto* sq = seq();
-    if (!sq) return;
-    if (sq->isRecording())                                  sq->playback();
-    else if (!start_with_song(crosspad::SyncTake::Record))  sq->record();
-    sync_ui();
-}
-void dub_cb(lv_event_t*)
-{
-    auto* sq = seq();
-    if (sq && !start_with_song(crosspad::SyncTake::Overdub)) sq->overdub();
-    sync_ui();
-}
-void play_cb(lv_event_t*)
-{
-    auto* sq = seq();
-    if (sq && !start_with_song(crosspad::SyncTake::None)) sq->playback();
-    sync_ui();
-}
-/// The song too, when it is the one running the sequencer.
-void stop_cb(lv_event_t*)
-{
-    auto* se = songs();
-    if (se && se->playing() && song_sync()) se->stop();
-    if (auto* sq = seq()) sq->stop();
-    sync_ui();
-}
+/* PLAY, STOP, REC and DUB used to be four buttons on this screen, with the
+ * song-synced start, the counted-in take, the second REC that closes a take
+ * and the stop that takes the song with it. They are in the transport bar
+ * now, and those four rules went with them into
+ * crosspad::SequencerTransport -- not dropped. start_with_song() went too.
+ */
 
 // ── bounce ─────────────────────────────────────────────────────────────────
 
@@ -626,6 +847,63 @@ void bounce_close_cb(lv_event_t*)
         return;
     }
     bounce_close();
+}
+
+/* Both window makers hang callbacks that are written below them, and they use
+ * the row helper the main screen is built with. */
+void swing_val_cb(lv_event_t* e);
+void swing_set_cb(lv_event_t* e);
+lv_obj_t* make_row(lv_obj_t* parent, int32_t h);
+
+/// The amount, as a button the encoder turns: the idiom the tempo uses, so the
+/// gesture is the one already learned on the screen behind.
+lv_obj_t* swing_value(lv_obj_t* parent)
+{
+    lv_obj_t* b = lv_CreateEditableButton(parent);
+    lv_obj_set_size(b, 56, 26);
+    lv_obj_set_style_pad_all(b, 0, 0);
+    lv_obj_set_style_radius(b, 6, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_bg_color(b, kPanel, 0);
+    lv_obj_set_style_bg_color(b, kAccent, LV_STATE_EDITED);
+    lv_obj_set_style_text_color(b, kText, 0);
+    lv_obj_set_style_text_color(b, kInk, LV_STATE_EDITED);
+    lv_obj_set_style_outline_color(b, kHead, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(b, 2, LV_STATE_FOCUS_KEY);
+    lv_obj_t* l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+    lv_obj_add_flag(l, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, swing_val_cb, LV_EVENT_KEY, nullptr);
+    lv_obj_add_event_cb(b, swing_val_cb, LV_EVENT_CLICKED, nullptr);
+#ifdef SEQ_USE_ENCODER
+    if (s_swingGroup) lv_group_add_obj(s_swingGroup, b);
+#endif
+    return b;
+}
+
+/// One of the sampler's steps: a chip in a row, not a row of its own -- seven
+/// of them would not fit the screen and a step is one number.
+lv_obj_t* swing_chip(lv_obj_t* parent, const char* text, void* intensity)
+{
+    lv_obj_t* b = lv_button_create(parent);
+    lv_obj_set_size(b, 40, 24);
+    lv_obj_set_style_pad_all(b, 0, 0);
+    lv_obj_set_style_radius(b, 5, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_bg_color(b, kPanel, 0);
+    lv_obj_set_style_outline_color(b, kHead, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(b, 2, LV_STATE_FOCUS_KEY);
+    lv_obj_add_event_cb(b, swing_set_cb, LV_EVENT_CLICKED, intensity);
+    lv_obj_t* l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(l, kText, 0);
+    lv_label_set_text(l, text);
+    lv_obj_center(l);
+#ifdef SEQ_USE_ENCODER
+    if (s_swingGroup) lv_group_add_obj(s_swingGroup, b);
+#endif
+    return b;
 }
 
 /// A row of the swing window. Its own maker rather than the bounce one, which
@@ -732,6 +1010,337 @@ void bounce_progress()
     lv_label_set_text(lv_obj_get_child(s_bounceBtn, 0), "OK");
 }
 
+// ── SRC: the kit, or an instrument borrowed from Pitch Play ────────────────
+
+void src_sync()
+{
+    if (!s_srcLabel) return;
+    if (s_src == Src::Kit) { set_text(s_srcLabel, "KIT"); return; }
+    if (!s_instReady.load()) { set_text(s_srcLabel, "..."); return; }
+    /* Eight characters of font 10 fit the 48 px button; a longer name is cut
+     * with a dot, so a cut reads as one rather than as a misspelling. */
+    char buf[16];
+    if (s_instName.size() <= 8) std::snprintf(buf, sizeof(buf), "%s", s_instName.c_str());
+    else                        std::snprintf(buf, sizeof(buf), "%.7s.", s_instName.c_str());
+    set_text(s_srcLabel, buf);
+}
+
+/// The pads stop playing the kit and start playing notes. Idempotent.
+void src_take_pads()
+{
+    if (s_padLogicPushed) return;
+    auto& pm = crosspad::getPadManager();
+    if (!s_srcPadLogic) {
+        s_srcPadLogic = std::make_shared<crosspad::InstrumentPadLogic>();
+        pm.registerPadLogic(kSrcPadLogic, s_srcPadLogic);
+    }
+    pm.pushPadLogic(kSrcPadLogic);
+    s_padLogicPushed = true;
+}
+
+/// And back. Pop before anything unregisters the handler, or the pop lands on
+/// a name that no longer resolves and leaves the pads with no logic at all.
+void src_drop_pads()
+{
+    if (!s_padLogicPushed) return;
+    crosspad::getPadManager().popPadLogic();
+    s_padLogicPushed = false;
+}
+
+void src_fill();
+
+/// Give the engine back and let the kit load again.
+void src_to_kit()
+{
+    src_drop_pads();
+    s_instReady.store(false);
+    if (s_srcPadLogic) s_srcPadLogic->setReady(false);
+    s_src = Src::Kit;
+    s_instPath.clear();
+    s_instName.clear();
+    s_srcNote.clear();
+    if (auto* h = inst_host()) h->release();
+    src_sync();
+    src_fill();
+}
+
+/// Borrow the engine for @p path. The load runs on the host's worker; the
+/// pads stay quiet until src_poll() sees Ready.
+void src_to_inst(const std::string& path, const std::string& name)
+{
+    auto* h = inst_host();
+    if (!h) { s_srcNote = "No instrument engine on this build."; src_fill(); return; }
+    if (!h->requestOpen(path)) { s_srcNote = "Busy -- try again."; src_fill(); return; }
+    s_src = Src::Inst;
+    s_instPath = path;
+    s_instName = name;
+    s_instReady.store(false);
+    if (s_srcPadLogic) s_srcPadLogic->setReady(false);
+    s_srcNote = "Loading " + name + "...";
+    src_take_pads();          // before Ready: a hit now is silent, not a kit pad
+    src_sync();
+    src_fill();
+}
+
+/// Host and listing, from the app tick.
+void src_poll()
+{
+    /* Pitch Play gives the engine back to the kits whenever it closes --
+     * every time, whatever else was playing through it. Leaving it from this
+     * screen's EDIT therefore pulled the instrument out from under a pattern
+     * that was playing it, and the next bar came out of the kit's pads
+     * instead. The source is this screen's, so this screen takes it back: on
+     * the edge where the bank goes away, and once, so a load that cannot
+     * succeed is not retried every tick. */
+    if (s_src == Src::Inst && !s_instPath.empty()) {
+        auto* h = inst_host();
+        const bool gone = h && h->state() == crosspad::IInstrumentHost::State::Idle;
+        static bool wasGone = false;
+        if (gone && !wasGone) {
+            s_instReady.store(false);
+            if (s_srcPadLogic) s_srcPadLogic->setReady(false);
+            if (h->requestOpen(s_instPath)) s_srcNote = "Taking " + s_instName + " back ...";
+        }
+        wasGone = gone;
+    }
+
+    /* Pitch Play may have been opened and changed while this app sat behind
+     * it, so the map is re-read whenever the published generation moves --
+     * not only when this window is open, because the pads play from it. */
+    if (crosspad::instrumentPlayState().generation != s_playGen) {
+        seq_rebuild_pads();
+        if (s_srcBox) src_fill();
+    }
+
+    if (s_srcListing) {
+        auto* st = tools();
+        if (st) {
+            const crosspad::ToolJob job = st->job();
+            if (job == crosspad::ToolJob::Ready || job == crosspad::ToolJob::Failed) {
+                s_srcLib.clear();
+                if (job == crosspad::ToolJob::Ready) {
+                    const auto f = st->folder();
+                    for (size_t i = 0; i < f.folders; ++i) s_srcLib.push_back(f.name(i));
+                }
+                s_srcListing = false;
+                src_fill();
+            }
+        } else {
+            s_srcListing = false;
+        }
+    }
+
+    if (s_src != Src::Inst) return;
+    auto* h = inst_host();
+    if (!h) return;
+    const auto state = h->state();
+    if (state == crosspad::IInstrumentHost::State::Ready) {
+        if (s_srcPadLogic) s_srcPadLogic->setReady(true);
+        if (!s_instReady.exchange(true)) {
+            const std::string msg = h->message();
+            s_srcNote = msg.empty() ? std::string() : msg;
+            src_sync();
+            src_fill();
+        }
+    } else if (state == crosspad::IInstrumentHost::State::Failed) {
+        const std::string why = h->message();
+        src_to_kit();
+        s_srcNote = why.empty() ? std::string("Could not load that instrument.") : why;
+        src_fill();
+    }
+}
+
+void src_close()
+{
+    if (!s_srcBox) return;
+#ifdef SEQ_USE_ENCODER
+    if (indev_encoderTop && s_encGroup) lv_indev_set_group(indev_encoderTop, s_encGroup);
+    lv_group_delete_deferred(s_srcGroup);   // the click that closed it is still being read
+    s_srcGroup = nullptr;
+#endif
+    lv_obj_delete_async(s_srcBox);
+    s_srcBox = s_srcList = s_srcNoteLbl = s_srcOctLbl = s_srcChordLbl = nullptr;
+    s_srcClose = nullptr;
+    sync_ui();
+}
+
+void src_close_cb(lv_event_t*) { src_close(); }
+
+void src_pick_cb(lv_event_t* e)
+{
+    const auto idx = (size_t)(uintptr_t)lv_event_get_user_data(e);
+    if (idx == 0) { src_to_kit(); return; }
+    const size_t i = idx - 1;
+    if (i >= s_srcLib.size()) return;
+    auto* h = inst_host();
+    if (!h) return;
+    const std::string name = s_srcLib[i];
+    src_to_inst(h->libraryRoot() + "/" + name + "/" + crosspad::IInstrumentHost::kFileName, name);
+}
+
+
+
+lv_obj_t* src_button(lv_obj_t* parent, const char* text, lv_event_cb_t cb, void* ud, bool on)
+{
+    lv_obj_t* b = lv_button_create(parent);
+    lv_obj_set_size(b, LV_PCT(100), 24);
+    lv_obj_set_style_radius(b, 6, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_bg_color(b, on ? kAccent : kPanel, 0);
+    lv_obj_set_style_outline_color(b, kHead, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(b, 2, LV_STATE_FOCUS_KEY);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
+    lv_obj_t* l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(l, on ? kInk : kText, 0);
+    lv_label_set_text(l, text);
+    lv_obj_center(l);
+#ifdef SEQ_USE_ENCODER
+    if (s_srcGroup) lv_group_add_obj(s_srcGroup, b);
+#endif
+    return b;
+}
+
+/// Rebuild the window's contents. Safe when it is closed -- the source can
+/// change from the poll, and then there is only the SRC label to update.
+void src_fill()
+{
+    src_sync();
+    if (!s_srcList) return;
+    /* Only the list is rebuilt. Deleting its buttons takes them out of the
+     * group by itself, so nothing else has to be removed -- an earlier
+     * lv_group_remove_all_objs() here took OCT and Close out with them and
+     * the encoder could never reach them again. */
+    lv_obj_clean(s_srcList);
+
+    src_button(s_srcList, "KIT -- the loaded kit", src_pick_cb, (void*)(uintptr_t)0,
+               s_src == Src::Kit);
+    for (size_t i = 0; i < s_srcLib.size(); ++i) {
+        char buf[40];
+        std::snprintf(buf, sizeof(buf), LV_SYMBOL_KEYBOARD " %.32s", s_srcLib[i].c_str());
+        src_button(s_srcList, buf, src_pick_cb, (void*)(uintptr_t)(i + 1),
+                   s_src == Src::Inst && s_instName == s_srcLib[i]);
+    }
+    if (s_srcLib.empty() && !s_srcListing) {
+        lv_obj_t* l = lv_label_create(s_srcList);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(l, kDim, 0);
+        lv_obj_set_width(l, LV_PCT(100));
+        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(l, "No instruments yet -- make one in Pitch Play and SAVE it.");
+    }
+
+    if (s_srcOctLbl) {
+        char n0[8], n1[8], buf[32];
+        note_name(s_ps.padMidiMap[0], n0, sizeof(n0));
+        note_name(s_ps.padMidiMap[kSeqPads - 1], n1, sizeof(n1));
+        std::snprintf(buf, sizeof(buf), "%s - %s", n0, n1);
+        set_text(s_srcOctLbl, buf);
+    }
+    if (s_srcChordLbl) {
+        const std::string& cn = crosspad::instrumentPlayState().chordName;
+        set_text(s_srcChordLbl, cn.empty() ? "--" : cn.c_str());
+    }
+    if (s_srcNoteLbl) set_text(s_srcNoteLbl, s_srcNote.c_str());
+
+#ifdef SEQ_USE_ENCODER
+    /* The list's new buttons were appended to the group; move the three
+     * below it back behind them so turning the encoder still walks the
+     * window top to bottom. */
+    if (s_srcGroup) {
+        for (lv_obj_t* o : {s_srcClose}) {
+            if (!o) continue;
+            lv_group_remove_obj(o);
+            lv_group_add_obj(s_srcGroup, o);
+        }
+    }
+#endif
+}
+
+void src_cb(lv_event_t*)
+{
+    if (s_srcBox) { src_close(); return; }
+
+    s_srcBox = lv_obj_create(s_root);
+    lv_obj_remove_style_all(s_srcBox);
+    lv_obj_set_size(s_srcBox, LV_PCT(100), LV_PCT(100));
+    lv_obj_add_flag(s_srcBox, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_style_bg_color(s_srcBox, kBg, 0);
+    lv_obj_set_style_bg_opa(s_srcBox, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(s_srcBox, 8, 0);
+    lv_obj_set_style_pad_row(s_srcBox, 4, 0);
+    lv_obj_set_flex_flow(s_srcBox, LV_FLEX_FLOW_COLUMN);
+    lv_obj_remove_flag(s_srcBox, LV_OBJ_FLAG_SCROLLABLE);
+
+#ifdef SEQ_USE_ENCODER
+    s_srcGroup = lv_group_create();
+    if (indev_encoderTop) lv_indev_set_group(indev_encoderTop, s_srcGroup);
+#endif
+
+    lv_obj_t* title = lv_label_create(s_srcBox);
+    lv_obj_set_style_text_color(title, kText, 0);
+    lv_label_set_text(title, "What the pads record");
+
+    s_srcList = lv_obj_create(s_srcBox);
+    lv_obj_remove_style_all(s_srcList);
+    lv_obj_set_width(s_srcList, LV_PCT(100));
+    lv_obj_set_flex_grow(s_srcList, 1);
+    lv_obj_set_flex_flow(s_srcList, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_srcList, 3, 0);
+
+    /* What Pitch Play is set to: the pads' range and what a pad makes. Read
+     * only, and it used to be two rows of -/+ here. They are gone on purpose:
+     * the instrument source is Pitch Play's instrument, so a second place to
+     * set the key, the base note and the chord could only disagree with the
+     * first -- and did, the same pattern sounding one way under the pads and
+     * another recorded. Set it in Pitch Play; this says what it is. */
+    lv_obj_t* info = make_row(s_srcBox, 24);
+    lv_obj_t* il = lv_label_create(info);
+    lv_obj_set_style_text_font(il, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(il, kDim, 0);
+    lv_label_set_text(il, "Pitch Play");
+    s_srcOctLbl = lv_label_create(info);
+    lv_obj_set_flex_grow(s_srcOctLbl, 1);
+    lv_obj_set_style_text_font(s_srcOctLbl, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_align(s_srcOctLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_srcOctLbl, kAccent, 0);
+    lv_label_set_text(s_srcOctLbl, "");
+    s_srcChordLbl = lv_label_create(info);
+    lv_obj_set_style_text_font(s_srcChordLbl, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_align(s_srcChordLbl, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_color(s_srcChordLbl, kAccent, 0);
+    lv_label_set_text(s_srcChordLbl, "");
+
+    s_srcNoteLbl = lv_label_create(s_srcBox);
+    lv_obj_set_style_text_font(s_srcNoteLbl, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(s_srcNoteLbl, kAmber, 0);
+    lv_obj_set_width(s_srcNoteLbl, LV_PCT(100));
+    lv_label_set_long_mode(s_srcNoteLbl, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(s_srcNoteLbl, "");
+
+    lv_obj_t* close = lv_button_create(s_srcBox);
+    lv_obj_set_size(close, LV_PCT(100), 24);
+    lv_obj_set_style_radius(close, 6, 0);
+    lv_obj_set_style_shadow_width(close, 0, 0);
+    lv_obj_set_style_bg_color(close, kPanel, 0);
+    s_srcClose = close;
+    lv_obj_add_event_cb(close, src_close_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_center(lv_label_create(close));
+    lv_label_set_text(lv_obj_get_child(close, 0), "Close");
+#ifdef SEQ_USE_ENCODER
+    if (s_srcGroup) { lv_group_add_obj(s_srcGroup, close); lv_group_focus_obj(close); }
+#endif
+
+    /* Ask the card what is in the library; src_poll() fills the list when the
+     * answer comes. The window opens with whatever was last read. */
+    if (auto* st = tools()) {
+        if (auto* h = inst_host()) {
+            if (st->requestFolder(st->cardRoot() + h->libraryRoot())) s_srcListing = true;
+        }
+    }
+    src_fill();
+}
+
 // ── swing ──────────────────────────────────────────────────────────────────
 
 /* Swing is late, not moved: every second subdivision sounds a share of one
@@ -753,35 +1362,78 @@ void swing_close()
     s_swingGroup = nullptr;
 #endif
     lv_obj_delete_async(s_swingBox);
-    s_swingBox = s_swingText = nullptr;
+    s_swingBox = s_swingText = s_swingVal = nullptr;
+    for (auto& c : s_swingChip) c = nullptr;
     sync_ui();
 }
 
 void swing_close_cb(lv_event_t*) { swing_close(); }
 
-/// The line at the top of the window: what the setting means, in beats.
+/* The steps a sampler's swing knob clicks through, 50 % to 75 %, and what each
+ * is on the 0..100 scale: intensity = (sampler - 50) * 4. The triplet one is
+ * the exception -- those machines print 66 % and mean two thirds of the way
+ * through the pair, which is 67 here, so the chip says 66 and sets the feel
+ * rather than the rounding. */
+struct SwingStep { uint8_t sampler; uint8_t intensity; };
+const SwingStep kSwingSteps[7] = {
+    {50, 0}, {54, 16}, {58, 32}, {62, 48}, {66, 67}, {70, 80}, {75, 100},
+};
+
+/// What it is set to, in the two numbers a player might be thinking in.
 void swing_paint()
 {
     auto* sq = seq();
-    if (!sq || !s_swingText) return;
+    if (!sq) return;
     const uint8_t pct = sq->getSwing();
     const uint8_t per = sq->getSwingPerBeat();
-    if (!pct) {
-        set_text(s_swingText, "Straight -- every subdivision on its own line");
-    } else {
-        set_text_fmt(s_swingText, "%u %% late on every second 1/%u%s",
-                     (unsigned)pct, (unsigned)(per * 4),
-                     pct >= 48 && pct <= 52 ? "   (triplet feel)" : "");
+    if (s_swingVal) {
+        char v[8];
+        std::snprintf(v, sizeof(v), "%u", (unsigned)pct);
+        set_text(lv_obj_get_child(s_swingVal, 0), v);
+    }
+    if (s_swingText) {
+        if (!pct) {
+            set_text(s_swingText, "straight -- every subdivision on its own line");
+        } else {
+            set_text_fmt(s_swingText, "1/%u   .   sampler %u %%%s",
+                         (unsigned)(per * 4), (unsigned)(50 + pct / 4),
+                         pct >= 66 && pct <= 68 ? "   .   triplet feel" : "");
+        }
+    }
+    /* The step it is standing on, lit. Turned off a step, nothing is lit --
+     * which is the honest answer. */
+    for (int i = 0; i < 7; ++i) {
+        if (!s_swingChip[i]) continue;
+        const bool on = kSwingSteps[i].intensity == pct;
+        lv_obj_set_style_bg_color(s_swingChip[i], on ? kAmber : kPanel, 0);
+        if (lv_obj_t* l = lv_obj_get_child(s_swingChip[i], 0)) {
+            lv_obj_set_style_text_color(l, on ? kInk : kText, 0);
+        }
     }
 }
 
-void swing_step_cb(lv_event_t* e)
+/// The amount, turned: focus it, press to take it, a point per detent, press
+/// again to let go -- the same way the tempo is turned on the screen behind.
+void swing_val_cb(lv_event_t* e)
 {
     auto* sq = seq();
-    if (!sq) return;
-    const int by = (int)(intptr_t)lv_event_get_user_data(e);
-    const int now = (int)sq->getSwing() + by;
-    sq->setSwing((uint8_t)(now < 0 ? 0 : (now > 75 ? 75 : now)));
+    lv_obj_t* b = static_cast<lv_obj_t*>(lv_event_get_current_target(e));
+    if (!sq || !b) return;
+    lv_group_t* g = lv_obj_get_group(b);
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        if (g) {
+            const bool editing = lv_group_get_editing(g) && lv_group_get_focused(g) == b;
+            lv_group_focus_obj(b);
+            lv_group_set_editing(g, !editing);
+        }
+        return;
+    }
+    const uint32_t key = lv_event_get_key(e);
+    const int step = key == LV_KEY_RIGHT || key == LV_KEY_UP ? 1
+                   : (key == LV_KEY_LEFT || key == LV_KEY_DOWN ? -1 : 0);
+    if (!step) return;
+    const int now = (int)sq->getSwing() + step;
+    sq->setSwing((uint8_t)(now < 0 ? 0 : (now > 100 ? 100 : now)));
     swing_paint();
 }
 
@@ -838,19 +1490,37 @@ void swing_cb(lv_event_t*)
     lv_obj_set_width(s_swingText, LV_PCT(100));
     lv_label_set_text(s_swingText, "");
 
-    [[maybe_unused]] lv_obj_t* less =   // focused for the encoder only
-        swing_button(s_swingBox, LV_SYMBOL_MINUS "  2 %", swing_step_cb, (void*)(intptr_t)-2);
-    swing_button(s_swingBox, LV_SYMBOL_PLUS "  2 %", swing_step_cb, (void*)(intptr_t)2);
+    /* The amount, big, with the scale beside it: one knob from nothing to as
+     * far as those machines go. */
+    lv_obj_t* amount = make_row(s_swingBox, 30);
+    lv_obj_t* tag = lv_label_create(amount);
+    lv_obj_set_style_text_font(tag, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(tag, kDim, 0);
+    lv_label_set_text(tag, "AMOUNT");
+    s_swingVal = swing_value(amount);
+    lv_obj_t* of = lv_label_create(amount);
+    lv_obj_set_style_text_font(of, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(of, kDim, 0);
+    lv_label_set_text(of, "of 100");
+
     char unit[20];
     lv_snprintf(unit, sizeof(unit), "Swing the 1/%u", (unsigned)(sq->getSwingPerBeat() * 4));
     swing_button(s_swingBox, unit, swing_unit_cb, nullptr);
-    swing_button(s_swingBox, "Triplet feel (50 %)", swing_set_cb, (void*)(intptr_t)50);
-    swing_button(s_swingBox, "Straight (off)", swing_set_cb, (void*)(intptr_t)0);
+
+    /* The sampler's own steps, in a row: the numbers printed on those machines,
+     * so a groove learned on one lands here by name. */
+    lv_obj_t* steps = make_row(s_swingBox, 26);
+    for (int i = 0; i < 7; ++i) {
+        char label[8];
+        lv_snprintf(label, sizeof(label), "%u", (unsigned)kSwingSteps[i].sampler);
+        s_swingChip[i] = swing_chip(steps, label, (void*)(intptr_t)kSwingSteps[i].intensity);
+    }
+
     swing_button(s_swingBox, LV_SYMBOL_OK "  Done", swing_close_cb, nullptr);
 
     swing_paint();
 #ifdef SEQ_USE_ENCODER
-    if (s_swingGroup) lv_group_focus_obj(less);
+    if (s_swingGroup) lv_group_focus_obj(s_swingVal);
 #endif
 }
 
@@ -903,9 +1573,10 @@ lv_obj_t* make_button(lv_obj_t* parent, int32_t w, int32_t h, const char* text,
     lv_obj_t* b = lv_button_create(parent);
     lv_obj_set_size(b, w, h);
     lv_obj_set_style_pad_all(b, 0, 0);
-    lv_obj_set_style_radius(b, 6, 0);
+    lv_obj_set_style_radius(b, 4, 0);
     lv_obj_set_style_shadow_width(b, 0, 0);
     lv_obj_set_style_bg_color(b, kPanel, 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x2C3239), LV_STATE_PRESSED);
     lv_obj_set_style_outline_color(b, kHead, LV_STATE_FOCUS_KEY);
     lv_obj_set_style_outline_width(b, 2, LV_STATE_FOCUS_KEY);
     if (cb) lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
@@ -956,6 +1627,8 @@ lv_obj_t* make_bpm(lv_obj_t* parent)
     lv_obj_center(l);
     lv_obj_add_event_cb(b, bpm_cb, LV_EVENT_KEY, nullptr);
     lv_obj_add_event_cb(b, bpm_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(b, bpm_cb, LV_EVENT_FOCUSED, nullptr);
+    lv_obj_add_event_cb(b, bpm_cb, LV_EVENT_DEFOCUSED, nullptr);
 #ifdef SEQ_USE_ENCODER
     if (s_encGroup) lv_group_add_obj(s_encGroup, b);
 #endif
@@ -963,6 +1636,108 @@ lv_obj_t* make_bpm(lv_obj_t* parent)
 }
 
 } // namespace
+
+/* ── scene window ───────────────────────────────────────────────────────────
+ *
+ * What the design's two rows had no room for. The tempo is here rather than
+ * on the screen because the transport bar shows it and nothing else can edit
+ * it yet -- leaving it out of both would have meant a board whose tempo
+ * cannot be changed at all. ADD and DEL make and unmake scenes; SRC and SYNC
+ * are this sequencer's own and belong to no design row. */
+
+void scene_menu_close()
+{
+    if (!s_sceneMenu) return;
+#ifdef SEQ_USE_ENCODER
+    if (indev_encoderTop && s_encGroup) lv_indev_set_group(indev_encoderTop, s_encGroup);
+    lv_group_delete_deferred(s_sceneGroup);   // the click that closed it is still being read
+    s_sceneGroup = nullptr;
+#endif
+    lv_obj_delete_async(s_sceneMenu);
+    s_sceneMenu = nullptr;
+    s_bpm = nullptr;
+    s_srcBtn = s_srcLabel = nullptr;
+    s_syncBtn = nullptr;
+    sync_ui();
+}
+
+void scene_menu_close_cb(lv_event_t*) { scene_menu_close(); }
+
+/// A row of the scene window, in its group rather than the screen's.
+lv_obj_t* scene_menu_button(lv_obj_t* parent, int32_t w, const char* text, lv_event_cb_t cb)
+{
+    lv_obj_t* b = lv_button_create(parent);
+    lv_obj_set_size(b, w, 28);
+    lv_obj_set_style_pad_all(b, 0, 0);
+    lv_obj_set_style_radius(b, 4, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_bg_color(b, kPanel, 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x2C3239), LV_STATE_PRESSED);
+    lv_obj_set_style_outline_color(b, kHead, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(b, 2, LV_STATE_FOCUS_KEY);
+    if (cb) lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(l, kText, 0);
+    lv_label_set_text(l, text);
+    lv_obj_center(l);
+#ifdef SEQ_USE_ENCODER
+    if (s_sceneGroup) lv_group_add_obj(s_sceneGroup, b);
+#endif
+    return b;
+}
+
+void scene_menu_cb(lv_event_t*)
+{
+    if (!seq() || s_sceneMenu) return;
+
+    s_sceneMenu = lv_obj_create(s_root);
+    lv_obj_remove_style_all(s_sceneMenu);
+    lv_obj_set_size(s_sceneMenu, LV_PCT(100), LV_PCT(100));
+    lv_obj_add_flag(s_sceneMenu, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_style_bg_color(s_sceneMenu, kBg, 0);
+    lv_obj_set_style_bg_opa(s_sceneMenu, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(s_sceneMenu, 8, 0);
+    lv_obj_set_style_pad_row(s_sceneMenu, 5, 0);
+    lv_obj_set_flex_flow(s_sceneMenu, LV_FLEX_FLOW_COLUMN);
+    lv_obj_remove_flag(s_sceneMenu, LV_OBJ_FLAG_SCROLLABLE);
+#ifdef SEQ_USE_ENCODER
+    s_sceneGroup = lv_group_create();
+    if (indev_encoderTop) lv_indev_set_group(indev_encoderTop, s_sceneGroup);
+#endif
+
+    lv_obj_t* title = lv_label_create(s_sceneMenu);
+    lv_obj_set_style_text_color(title, kText, 0);
+    lv_label_set_text(title, "SCENE");
+
+    /* Tempo first: it is the one thing here that no other screen can set. */
+    lv_obj_t* tempo = make_row(s_sceneMenu, 30);
+    lv_obj_t* tag = lv_label_create(tempo);
+    lv_obj_set_style_text_font(tag, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(tag, kDim, 0);
+    lv_label_set_text(tag, "BPM");
+    s_bpm = make_bpm(tempo);
+#ifdef SEQ_USE_ENCODER
+    if (s_sceneGroup && s_bpm) lv_group_add_obj(s_sceneGroup, s_bpm);
+#endif
+
+    lv_obj_t* scenes = make_row(s_sceneMenu, 28);
+    scene_menu_button(scenes, 68, LV_SYMBOL_PLUS "  ADD", scene_add_cb);
+    scene_menu_button(scenes, 68, LV_SYMBOL_MINUS "  DEL", scene_del_cb);
+
+    lv_obj_t* srcs = make_row(s_sceneMenu, 28);
+    s_srcBtn = scene_menu_button(srcs, 68, "KIT", src_cb);
+    s_srcLabel = lv_obj_get_child(s_srcBtn, 0);
+    s_syncBtn = scene_menu_button(srcs, 68, "SYNC", sync_cb);
+    src_sync();
+
+    scene_menu_button(s_sceneMenu, 120, LV_SYMBOL_OK "  Done", scene_menu_close_cb);
+
+    sync_ui();
+#ifdef SEQ_USE_ENCODER
+    if (s_sceneGroup && s_bpm) lv_group_focus_obj(s_bpm);
+#endif
+}
 
 lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
 {
@@ -977,15 +1752,50 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
     lv_obj_set_style_bg_color(s_root, kBg, 0);
     lv_obj_set_style_border_width(s_root, 0, 0);
     lv_obj_set_style_radius(s_root, 0, 0);
-    lv_obj_set_style_pad_all(s_root, 5, 0);
-    lv_obj_set_style_pad_row(s_root, 4, 0);
-    lv_obj_set_flex_flow(s_root, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(s_root, 0, 0);
     lv_obj_remove_flag(s_root, LV_OBJ_FLAG_SCROLLABLE);
 
-    // -- what the scene is counted in --
-    lv_obj_t* top = make_row(s_root, 22);
-    make_button(top, 30, 22, LV_SYMBOL_LEFT, back_cb, app);
-    s_bpm = make_bpm(top);
+    /* Absolute positions, not the flex column this screen had: the design
+     * fixes every row to a screen y and its two gaps are not equal -- 5 above
+     * the grid, 6 below it -- which one pad_row cannot express. SEQ_Y turns a
+     * screen y into a root y: the root fills the app container, which begins
+     * under the 30 px transport bar. */
+#define SEQ_Y(v) ((v) - TRANSPORT_BAR_HEIGHT)
+    auto place = [](lv_obj_t* o, int32_t x, int32_t y) { if (o) lv_obj_set_pos(o, x, y); return o; };
+
+    /* ── context row: which scene, how long, how snapped ──────────────────
+     * No back button and no tempo field: back is the power button's click
+     * everywhere, and the tempo is in the transport bar (edited in the scene
+     * window behind the name). */
+    place(make_button(s_root, 20, 22, LV_SYMBOL_LEFT, scene_prev_cb), 6, SEQ_Y(35));
+
+    s_sceneBtn = make_button(s_root, 56, 22, "Seq 1/1", scene_menu_cb);
+    place(s_sceneBtn, 26, SEQ_Y(35));
+    s_sceneLabel = lv_obj_get_child(s_sceneBtn, 0);
+    /* The design sets the name in montserrat 12, which this firmware does not
+     * build; 14 is the next one up and 56 px holds "Seq 1/1" in it. Flat,
+     * because the design draws the name on the background and not as a key --
+     * it only has to look like a button once the encoder reaches it. */
+    lv_obj_set_style_text_font(s_sceneLabel, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_bg_opa(s_sceneBtn, LV_OPA_TRANSP, 0);
+
+    place(make_button(s_root, 20, 22, LV_SYMBOL_RIGHT, scene_next_cb), 82, SEQ_Y(35));
+    place(make_button(s_root, 22, 22, LV_SYMBOL_MINUS, len_dn_cb), 108, SEQ_Y(35));
+    place(make_button(s_root, 22, 22, LV_SYMBOL_PLUS,  len_up_cb), 134, SEQ_Y(35));
+
+    lv_obj_t* barsBtn = make_button(s_root, 30, 22, "4b", bars_cb);
+    place(barsBtn, 162, SEQ_Y(35));
+    s_barsLabel = lv_obj_get_child(barsBtn, 0);
+
+    s_quantBtn = make_button(s_root, 36, 22, "1/16", quant_cb);
+    place(s_quantBtn, 196, SEQ_Y(35));
+    s_quantLabel = lv_obj_get_child(s_quantBtn, 0);
+
+    /* 78 px, so the amount is on the key rather than hidden behind it: a feel
+     * you cannot see the value of is one you cannot put back. */
+    s_swingBtn = make_button(s_root, 78, 22, "SWING", swing_cb);
+    place(s_swingBtn, 236, SEQ_Y(35));
+
     if (!s_tempoSub) {
         /* Event-bus task: only remember who drives the tempo; sync_ui() on
          * the LVGL timer shows it. */
@@ -996,69 +1806,105 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
                                       std::memory_order_relaxed);
             }, nullptr);
     }
-    s_clickBtn = make_button(top, 26, 22, "M", click_cb);
-    s_preBtn = make_button(top, 30, 22, "PRE", pre_cb);
-    lv_obj_t* barsBtn = make_button(top, 26, 22, "4b", bars_cb);
-    s_barsLabel = lv_obj_get_child(barsBtn, 0);
-    s_quantBtn = make_button(top, 36, 22, "1/16", quant_cb);
-    s_quantLabel = lv_obj_get_child(s_quantBtn, 0);
-    /* Beside the quantisation, because they are the same kind of thing: where
-     * a hit is put, and where it is heard. x2 and /2 give up six pixels each
-     * for it -- their labels are two characters. */
-    s_swingBtn = make_button(top, 44, 22, "SWING", swing_cb);
-    make_button(top, 24, 22, "x2", double_cb);
-    make_button(top, 24, 22, "/2", halve_cb);
 
-    // -- which scene, and ERASE held beside it --
-    lv_obj_t* scenes = make_row(s_root, 22);
-    make_button(scenes, 26, 22, LV_SYMBOL_LEFT, scene_prev_cb);
-    s_sceneLabel = lv_label_create(scenes);
-    lv_obj_set_width(s_sceneLabel, 64);
-    lv_obj_set_style_text_align(s_sceneLabel, LV_TEXT_ALIGN_CENTER, 0);
-    make_button(scenes, 26, 22, LV_SYMBOL_RIGHT, scene_next_cb);
-    make_button(scenes, 26, 22, LV_SYMBOL_MINUS, scene_del_cb);
-    make_button(scenes, 26, 22, LV_SYMBOL_PLUS, scene_add_cb);
-    lv_obj_t* gap = lv_obj_create(scenes);
-    lv_obj_remove_style_all(gap);
-    lv_obj_set_flex_grow(gap, 1);
-    make_button(scenes, 50, 22, "BOUNCE", bounce_cb);
-    s_eraseBtn = make_button(scenes, 60, 22, "ERASE", nullptr);
-    lv_obj_add_event_cb(s_eraseBtn, erase_cb, LV_EVENT_PRESSED, nullptr);
-    lv_obj_add_event_cb(s_eraseBtn, erase_cb, LV_EVENT_RELEASED, nullptr);
-    lv_obj_add_event_cb(s_eraseBtn, erase_cb, LV_EVENT_PRESS_LOST, nullptr);
-
-    // -- the pattern --
+    /* ── the pattern ──────────────────────────────────────────────────────
+     * Still drawn into the layer, not built from cells. The design lays out
+     * 12 rows x 16 boxes plus 17 line objects; this keeps 16 lanes -- all the
+     * pads, not twelve of them -- in the pad's own colour with the velocity
+     * as its opacity, which the mockup has no way to show, and costs no
+     * objects at all. On this board that is the difference between a screen
+     * and an out-of-memory: 209 LVGL objects is tens of kB of the PSRAM the
+     * UI lives in. */
     s_grid = lv_obj_create(s_root);
     lv_obj_remove_style_all(s_grid);
-    lv_obj_set_width(s_grid, LV_PCT(100));
-    lv_obj_set_flex_grow(s_grid, 1);
-    lv_obj_set_style_bg_color(s_grid, kPanel, 0);
+    place(s_grid, 6, SEQ_Y(62));
+    lv_obj_set_size(s_grid, 308, 138);
+    lv_obj_set_style_bg_color(s_grid, kGridBg, 0);
     lv_obj_set_style_bg_opa(s_grid, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_grid, 6, 0);
+    lv_obj_set_style_radius(s_grid, 4, 0);
     lv_obj_set_style_pad_all(s_grid, 3, 0);
     lv_obj_remove_flag(s_grid, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(s_grid, grid_draw_cb, LV_EVENT_DRAW_MAIN_END, nullptr);
 
-    // -- transport --
-    lv_obj_t* tr = make_row(s_root, 28);
-    s_recBtn  = make_button(tr, 58, 28, "REC", rec_cb);
-    s_dubBtn  = make_button(tr, 58, 28, "DUB", dub_cb);
-    s_playBtn = make_button(tr, 58, 28, LV_SYMBOL_PLAY, play_cb);
-    s_stopBtn = make_button(tr, 58, 28, LV_SYMBOL_STOP, stop_cb);
-    s_syncBtn = make_button(tr, 58, 28, "SYNC", sync_cb);
+    /* ── soft keys ──────────────────────────────────────────────────────
+     * Two rows, because this screen is two things. On its own: M (the click),
+     * PRE (the count-in), x2, /2, BOUNCE, ERASE. As an Arrange track's seq
+     * (the design's seq view): the way back to the arrangement and the way
+     * into its sound take the first two slots, and the rest is the same.
+     *
+     * Chosen here, not switched later, because an app is built on every start
+     * -- so what Arrange handed over is known by the time this runs. */
+    if (in_track()) {
+        s_arrBtn = make_button(s_root, 52, 28, LV_SYMBOL_LEFT " ARR", arr_back_cb);
+        place(s_arrBtn, 6, SEQ_Y(206));
+        s_editBtn = make_button(s_root, 56, 28, "EDIT " LV_SYMBOL_RIGHT, edit_src_cb);
+        place(s_editBtn, 62, SEQ_Y(206));
+        /* Lime: of the six keys this is the one that leads somewhere new --
+         * the sound the notes play through. */
+        lv_obj_set_style_bg_color(s_editBtn, kAccent, 0);
+        lv_obj_set_style_text_color(lv_obj_get_child(s_editBtn, 0), kInk, 0);
+        place(make_button(s_root, 30, 28, "x2", double_cb), 122, SEQ_Y(206));
+        place(make_button(s_root, 30, 28, "/2", halve_cb), 156, SEQ_Y(206));
+        place(make_button(s_root, 62, 28, "BOUNCE", track_bounce_cb), 190, SEQ_Y(206));
+        s_eraseBtn = make_button(s_root, 58, 28, "ERASE", nullptr);
+        place(s_eraseBtn, 256, SEQ_Y(206));
+    } else {
+        s_clickBtn = make_button(s_root, 34, 28, "M", click_cb);
+        place(s_clickBtn, 6, SEQ_Y(206));
+        s_preBtn = make_button(s_root, 44, 28, "PRE", pre_cb);
+        place(s_preBtn, 44, SEQ_Y(206));
+        place(make_button(s_root, 34, 28, "x2", double_cb), 92, SEQ_Y(206));
+        place(make_button(s_root, 34, 28, "/2", halve_cb), 130, SEQ_Y(206));
+        place(make_button(s_root, 72, 28, "BOUNCE", bounce_cb), 168, SEQ_Y(206));
+        s_eraseBtn = make_button(s_root, 70, 28, "ERASE", nullptr);
+        place(s_eraseBtn, 244, SEQ_Y(206));
+    }
+    lv_obj_add_event_cb(s_eraseBtn, erase_cb, LV_EVENT_PRESSED, nullptr);
+    lv_obj_add_event_cb(s_eraseBtn, erase_cb, LV_EVENT_RELEASED, nullptr);
+    lv_obj_add_event_cb(s_eraseBtn, erase_cb, LV_EVENT_PRESS_LOST, nullptr);
+#undef SEQ_Y
 
+
+    /* A track that plays through Pitch Play plays its instrument, not the
+     * kit. Pitch Play publishes which one (InstrumentPlayState), so there is
+     * nothing to ask the player here: the track said PITCH on Arrange's
+     * "plays with" card and this is what that means. With no instrument
+     * chosen yet the source stays the kit and the lime EDIT key is where one
+     * is picked -- which is what that key is for. */
+    if (in_track() && crosspad::arrangeFocus().source == crosspad::SeqSource::Pitch &&
+        s_src == Src::Kit) {
+        const crosspad::InstrumentPlayState& ps = crosspad::instrumentPlayState();
+        if (!ps.instrumentPath.empty()) src_to_inst(ps.instrumentPath, ps.instrumentName);
+    }
+
+    seq_rebuild_pads();
     sync_ui();
     s_drawn = pattern_shape();
     s_headX = -1;
 
 #ifdef SEQ_USE_ENCODER
-    if (s_encGroup) lv_group_focus_obj(s_playBtn);
+    /* The scene name: the first thing a player reaches for is which groove,
+     * and PLAY is on the transport bar now. */
+    if (s_encGroup && s_sceneBtn) lv_group_focus_obj(s_sceneBtn);
 #endif
 
     s_timer = lv_timer_create(tick_cb, kTickMs, nullptr);
 
     if (app) {
         app->setOnShow([](lv_obj_t*) {
+            /* PLAY, REC and DUB in the top bar mean this pattern while this
+             * screen is up. Without it the claim stayed with whatever took it
+             * last -- the Arranger's song, which cannot record -- and REC and
+             * DUB were greyed out here, so the screen that records was the one
+             * screen that could not. */
+            /* Opened from an Arrange track it records against the song:
+             * PLAY and REC play the arrangement with this scene laid on it,
+             * and a song already playing keeps playing into it -- the same
+             * playback, handed over. Opened on its own it is the pattern. */
+            auto* st = crosspad::sequencerTransport();
+            if (st) st->setFollowSong(in_track());
+            auto* se = songs();
+            crosspad::transportClaim(st, !(in_track() && se && se->playing()));
             if (s_timer) lv_timer_resume(s_timer);
 #ifdef SEQ_USE_ENCODER
             if (indev_encoderTop && s_encGroup) lv_indev_set_group(indev_encoderTop, s_encGroup);
@@ -1087,15 +1933,42 @@ void Sequencer_destroy(lv_obj_t* root)
      * erasing instead of playing. The loop itself keeps running, and so does
      * a bounce: it finishes on its own and lands in the song. */
     if (auto* sq = seq()) sq->setErasing(false);
+
+    /* The pads go back to the kit's. The engine too -- unless a bounce is
+     * still capturing them, which it does on its own after the screen is
+     * gone: reloading the kit under it would record the wrong instrument.
+     * It is then held until SRC is set back to KIT, or Pitch Play takes it. */
+    src_drop_pads();
+    if (s_src == Src::Inst && !s_bouncing) {
+        if (auto* h = inst_host()) h->release();
+        s_src = Src::Kit;
+        s_instPath.clear();
+        s_instName.clear();
+    }
+    s_instReady.store(false);
+    if (s_srcPadLogic) s_srcPadLogic->setReady(false);
+    s_srcNote.clear();
+    s_srcListing = false;
+
 #ifdef SEQ_USE_ENCODER
+    if (s_srcGroup) { lv_group_delete(s_srcGroup); s_srcGroup = nullptr; }
     if (s_bounceGroup) { lv_group_delete(s_bounceGroup); s_bounceGroup = nullptr; }
     if (s_swingGroup) { lv_group_delete(s_swingGroup); s_swingGroup = nullptr; }
 #endif
     s_bounceBox = s_bounceText = s_bounceBar = s_bounceBtn = nullptr;
-    s_swingBox = s_swingText = s_swingBtn = nullptr;
+    s_swingBox = s_swingText = s_swingVal = s_swingBtn = nullptr;
+    s_sceneMenu = s_sceneBtn = nullptr;
+#ifdef SEQ_USE_ENCODER
+    s_sceneGroup = nullptr;   // died with the tree, like the swing window's
+#endif
+    s_srcBox = s_srcList = s_srcNoteLbl = s_srcOctLbl = s_srcBtn = s_srcLabel = nullptr;
+    s_srcChordLbl = nullptr;
+    s_srcClose = nullptr;
+    for (auto& c : s_swingChip) c = nullptr;
     s_bouncing = false;
     s_root = s_grid = s_bpm = s_syncBtn = s_clickBtn = s_preBtn = s_barsLabel = nullptr;
     s_quantBtn = s_quantLabel = s_sceneLabel = s_eraseBtn = nullptr;
+    s_arrBtn = s_editBtn = nullptr;
     s_recBtn = s_dubBtn = s_playBtn = s_stopBtn = nullptr;
 
 #ifdef SEQ_USE_ENCODER

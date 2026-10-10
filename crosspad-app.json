@@ -1,7 +1,7 @@
 {
   "name": "Sequencer",
   "id": "sequencer",
-  "version": "0.3.2",
+  "version": "0.6.0",
   "description": "Record, loop and erase scenes on the pads",
   "category": "music",
   "icon": "sequencer.png",
@@ -15,6 +15,9 @@
     "crosspad-gui": ">=1.13.0"
   },
   "changelog": [
+    "0.6.0: the instrument source plays exactly what Pitch Play is set to -- its key, scale, transpose and chord, read from core InstrumentPlayState instead of a chromatic map and a chord index of our own. The Pads and Chord -/+ rows are gone; one read-only line says what Pitch Play has. Needs core 1.49.",
+    "0.5.0: a Chord row in the SRC window -- a pad plays a chord, not one note, through MusicTheory's types and progressions; the held notes are kept per pad so a release lets go of all of them. Needs core 1.44 (the ninths and the progression table).",
+    "0.4.0: SRC on the transport row picks what the pads record -- the loaded kit, or an instrument from Pitch Play's library, borrowed through IInstrumentHost and given back when the source goes back to KIT or the screen closes. The pads then play it chromatically from a base note the window sets (16 pads = 16 semitones). A bounce captures the pads bus, so it records whichever is playing; requires core 1.38 for the instrument host.",
     "0.3.2: BPM: a value being turned reads dark on the accent: the text colour sits on the button, which is the only thing ever EDITED, not on its label",
     "0.3.1: builds on the PC against LVGL 9.4 (0.2.1 merged in)",
     "0.3.0: SYNC on the transport (the song's switch): PLAY, REC and DUB from a stop start the arrangement and the sequencer with it, STOP stops both; pad 1 at the bottom of the grid; tempo is a button that shows the whole number, clicked to turn and clicked to leave (a spinbox scrolled its digits out of sight); requires core 1.23 and gui 1.13",
