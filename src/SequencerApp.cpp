@@ -44,10 +44,12 @@
 #include "crosspad/sampletools/ISampleTools.hpp"
 #include "crosspad/sequencer/SequencerController.hpp"
 #include "crosspad/transport/SequencerTransport.hpp"
+#include "crosspad/transport/SongTransport.hpp"
 #include "crosspad/song/ArrangeFocus.hpp"
 #include "crosspad/song/ISongEngine.hpp"
 #include "crosspad-gui/components/mode_overlay.h"
 #include "crosspad-gui/components/transport_bar.h"
+#include "crosspad-gui/components/ui_toast.h"
 #include "crosspad-gui/widgets/gui_helpers.h"
 
 #include "lvgl.h"
@@ -553,7 +555,11 @@ void sync_ui()
      * business and shows in Arrange's lane. The colour is the sound it plays
      * through, the same amber or purple the track's badge carries there. */
     if (in_track()) {
-        std::snprintf(buf, sizeof(buf), "T%u SEQ", (unsigned)(crosspad::arrangeFocus().track + 1));
+        /* Which block of the track: the bar it starts on. */
+        const auto* se = crosspad::getPlatformServices().songEngine;
+        const int32_t at = se ? se->seqEditBar() : -1;
+        const uint32_t bar = at >= 0 ? (uint32_t)at : crosspad::arrangeFocus().bar;
+        std::snprintf(buf, sizeof(buf), "T%u B%u", (unsigned)(crosspad::arrangeFocus().track + 1), (unsigned)(bar + 1));
         set_text(s_sceneLabel, buf);
         const lv_color_t ink = track_ink();
         if (!lv_color_eq(lv_obj_get_style_text_color(s_sceneLabel, LV_PART_MAIN), ink)) {
@@ -595,6 +601,10 @@ void src_poll();
 
 void tick_cb(lv_timer_t*)
 {
+    /* What changed in the scene goes back to the block it is. */
+    if (in_track()) {
+        if (auto* se = crosspad::getPlatformServices().songEngine) se->syncSeqEdit();
+    }
     if (s_bouncing) bounce_progress();
     src_poll();
     sync_ui();
@@ -733,37 +743,81 @@ void clear_cb(lv_event_t*)
 void halve_cb(lv_event_t*)  { if (auto* sq = seq()) sq->halveScene(sq->getActiveScene()); sync_ui(); }
 
 /* ── an Arrange track's seq ────────────────────────────────────────────────
- * Opened from Arrange (its SEQ card, or EDIT on a seq track), this screen is
- * one track of a song: the name says which track, the first two keys are the
- * way back to the arrangement and the way into the sound it plays, and the
- * scene shown is the one that track plays -- so stepping the scene re-points
- * the track rather than leaving it playing something that is not on screen.
+ * Opened from Arrange (its SEQ card, or CLIP EDIT on a seq block), this
+ * screen is one block of one track of a song: the name says which track and
+ * which bar the block starts on, the first two keys are the way back to the
+ * arrangement and the way into the sound it plays. The block's notes are put
+ * in the track's own scene and looped there on their own; what is recorded,
+ * erased, doubled or cleared goes back to the block as it changes
+ * (ISongEngine::syncSeqEdit), and Arrange draws it from there. On a bar with
+ * no block, the first notes made here become one. The scene is the block's,
+ * so it is not stepped or added to from here.
  *
  * With nothing handed over, none of this applies and the screen is the groove
  * sequencer it has always been. */
-/// The track now plays @p scene. Kept in the song, because that is where the
-/// arrangement reads it from when it draws the lane and when it bounces.
-void track_follow_scene(uint8_t scene)
+/// The block this screen edits, into the track's scene. One too long for a
+/// scene is left to Arrange, and the screen is the groove sequencer instead.
+void open_track_block()
 {
     if (!in_track()) return;
     auto* se = songs();
     if (!se) return;
-    const int track = crosspad::arrangeFocus().track;
+    crosspad::ArrangeFocus& f = crosspad::arrangeFocus();
+    if (se->openSeqEdit((uint8_t)f.track, f.bar, f.scene)) return;
+    ui_toast_show("That block is longer than a scene holds (8 bars, 192 notes): DUB or cut it in Arrange.",
+                  3500, UI_TOAST_INFO);
+    f.clear();
+}
+
+/// Opened from the MODE map (or anywhere but Arrange) on a song with a seq
+/// track that plays the kit: this screen is that track's block under
+/// Arrange's playhead, as CLIP EDIT would have opened it -- or the block the
+/// first notes make there. On its own it recorded into whatever scene was
+/// up, and Arrange showed the track empty and played nothing (11.10.2026). A
+/// song with no such track leaves the groove sequencer.
+void adopt_song_track()
+{
+    if (in_track()) return;
+    auto* se = songs();
+    auto* sq = seq();
+    if (!se || !sq) return;
+    crosspad::ArrangeFocus& f = crosspad::arrangeFocus();
+    bool moved = false;
     {
         std::lock_guard<std::recursive_mutex> l(se->songMutex());
-        auto& t = se->song().tracks[track];
-        if (!t.inUse || t.kind != crosspad::TrackKind::Seq || t.scene == scene) return;
-        t.scene = scene;
+        auto& song = se->song();
+        int track = -1;
+        for (int t = 0; t < crosspad::AudioSong::kTracks && track < 0; ++t) {
+            const auto& tr = song.tracks[t];
+            if (tr.inUse && tr.kind == crosspad::TrackKind::Seq) track = t;
+        }
+        if (track < 0 || song.tracks[track].source != crosspad::SeqSource::Kit) return;
+        auto& t = song.tracks[track];
+        /* A scene the sequencer does not have: one of its own again, as
+         * Arrange does before it hands a track over. */
+        if (t.scene >= sq->getSceneCount()) {
+            sq->addScene();
+            t.scene = sq->getActiveScene();
+            moved = true;
+        }
+        f.clear();
+        f.track  = track;
+        f.seq    = true;
+        f.source = t.source;
+        f.scene  = t.scene;
+        f.bar    = crosspad::songTransport().startBar();
     }
-    crosspad::arrangeFocus().scene = scene;
-    se->commit();
+    if (moved) se->commit();
+    sq->selectScene(f.scene);
 }
 
 /// Back to the arrangement. The track is left as it is -- its notes are in
 /// the scene, which is where they live -- and nothing is handed over any
-/// more, so the sequencer opened on its own next time is itself again.
+/// more; opened again, the screen finds the song's track itself
+/// (adopt_song_track()).
 void arr_back_cb(lv_event_t*)
 {
+    if (auto* se = songs()) se->closeSeqEdit();
     crosspad::arrangeFocus().clear();
     /* No Arrange in this firmware: the bar is refreshed anyway, so the keys
      * paint from a transport that nobody handed over. */
@@ -793,12 +847,11 @@ void edit_src_cb(lv_event_t*)
 void scene_step(int d)
 {
     auto* sq = seq();
-    if (!sq) return;
+    if (!sq || in_track()) return;
     const uint8_t n = sq->getSceneCount();
     if (!n) return;
     const uint8_t next = (uint8_t)((sq->getPendingScene() + n + d) % n);
     sq->selectScene(next);
-    track_follow_scene(next);
     sync_ui();
 }
 void scene_prev_cb(lv_event_t*) { scene_step(-1); }
@@ -806,8 +859,8 @@ void scene_next_cb(lv_event_t*) { scene_step(+1); }
 
 /// Minus drops the scene on show, plus appends an empty one and goes to it.
 /// The last scene never goes -- a kit has to have somewhere to record.
-void scene_del_cb(lv_event_t*) { if (auto* sq = seq()) sq->removeScene(sq->getActiveScene()); sync_ui(); }
-void scene_add_cb(lv_event_t*) { if (auto* sq = seq()) sq->addScene(); sync_ui(); }
+void scene_del_cb(lv_event_t*) { if (auto* sq = seq(); sq && !in_track()) sq->removeScene(sq->getActiveScene()); sync_ui(); }
+void scene_add_cb(lv_event_t*) { if (auto* sq = seq(); sq && !in_track()) sq->addScene(); sync_ui(); }
 
 /// Held, not toggled: hold it (the encoder's button or a finger) and hit
 /// pads -- each pad hit leaves the sounding scene. Letting go ends it.
@@ -1811,6 +1864,9 @@ void scene_menu_cb(lv_event_t*)
 
 lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
 {
+    /* Before anything is built: the keys and the name depend on it. */
+    adopt_song_track();
+
 #ifdef SEQ_USE_ENCODER
     if (indev_encoderTop) s_prevEncGroup = lv_indev_get_group(indev_encoderTop);
     if (!s_encGroup) s_encGroup = lv_group_create();
@@ -1960,14 +2016,10 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
              * last -- the Arranger's song, which cannot record -- and REC and
              * DUB were greyed out here, so the screen that records was the one
              * screen that could not. */
-            /* Opened from an Arrange track it records against the song:
-             * PLAY and REC play the arrangement with this scene laid on it,
-             * and a song already playing keeps playing into it -- the same
-             * playback, handed over. Opened on its own it is the pattern. */
-            auto* st = crosspad::sequencerTransport();
-            if (st) st->setFollowSong(in_track());
-            auto* se = songs();
-            crosspad::transportClaim(st, !(in_track() && se && se->playing()));
+            /* Opened from an Arrange track it is one block of it, looped on
+             * its own here; recording against the song is Arrange's REC. */
+            open_track_block();
+            crosspad::transportClaim(crosspad::sequencerTransport());
             if (s_timer) lv_timer_resume(s_timer);
 #ifdef SEQ_USE_ENCODER
             if (indev_encoderTop && s_encGroup) lv_indev_set_group(indev_encoderTop, s_encGroup);
@@ -1977,6 +2029,8 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
             if (s_timer) lv_timer_pause(s_timer);
             /* Erase must never outlive the button holding it. */
             if (auto* sq = seq()) sq->setErasing(false);
+            /* The block's last changes, whichever way the screen is left. */
+            if (auto* se = songs()) se->closeSeqEdit();
 #ifdef SEQ_USE_ENCODER
             if (indev_encoderTop && s_prevEncGroup) lv_indev_restore_group(indev_encoderTop, s_prevEncGroup);
 #endif
