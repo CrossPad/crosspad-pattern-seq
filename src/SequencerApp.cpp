@@ -135,12 +135,13 @@ lv_obj_t* s_grid = nullptr;
 lv_obj_t* s_bpm = nullptr;
 lv_obj_t* s_syncBtn = nullptr;
 lv_obj_t* s_levelsBtn = nullptr;   ///< the scene window's 16 LEVELS
-lv_obj_t* s_clickBtn = nullptr;
+lv_obj_t* s_clearBtn = nullptr;
+bool     s_clearArmed = false;           ///< CLEAR pressed once; the second press clears
+uint32_t s_clearArmedAt = 0;
+constexpr uint32_t kClearArmMs = 3000;   ///< how long the first press waits for the second
 lv_obj_t* s_preBtn = nullptr;
-/* The two keys this screen grows when Arrange sent it: the way back to the
- * arrangement, and the way into the sound the track plays. They stand where
- * M and PRE do -- those belong to a groove played on its own, and in a track's
- * context this screen is one track of a song. */
+/* The first two soft keys, opened from Arrange or on its own: the way to the
+ * arrangement, and the way into the sound the notes play through. */
 lv_obj_t* s_arrBtn = nullptr;
 lv_obj_t* s_editBtn = nullptr;
 lv_obj_t* s_barsLabel = nullptr;
@@ -510,7 +511,13 @@ void sync_ui()
     }
     paint(s_playBtn, (run && !rec && !dub) ? kPlay : kPanel, run && !rec && !dub);
     paint(s_stopBtn, kPanel, false);
-    paint(s_clickBtn, sq->getClickActive() ? kAmber : kPanel, sq->getClickActive());
+    /* CLEAR asked once: red, and saying what the second press does, until it
+     * is pressed again or the moment passes. */
+    if (s_clearArmed && lv_tick_elaps(s_clearArmedAt) > kClearArmMs) s_clearArmed = false;
+    if (s_clearBtn) {
+        paint(s_clearBtn, s_clearArmed ? kRec : kPanel, s_clearArmed);
+        set_text(lv_obj_get_child(s_clearBtn, 0), s_clearArmed ? "SURE?" : "CLEAR");
+    }
     if (auto* se = crosspad::getPlatformServices().songEngine) {
         bool sync = false;
         {
@@ -652,12 +659,6 @@ void pre_cb(lv_event_t*)
     sync_ui();
 }
 
-void click_cb(lv_event_t*)
-{
-    if (auto* sq = seq()) sq->setClickActive(!sq->getClickActive());
-    sync_ui();
-}
-
 void bars_cb(lv_event_t*)
 {
     auto* sq = seq();
@@ -712,6 +713,23 @@ void quant_cb(lv_event_t*)
 }
 
 void double_cb(lv_event_t*) { if (auto* sq = seq()) sq->doubleScene(sq->getActiveScene()); sync_ui(); }
+
+/// CLEAR: every note of the scene on show goes; the scene stays, with its
+/// length and its feel. Asked twice, as DEL is in the pad editor -- a whole
+/// pattern is too much to lose to one stray press.
+void clear_cb(lv_event_t*)
+{
+    auto* sq = seq();
+    if (!sq) return;
+    if (!s_clearArmed) {
+        s_clearArmed = true;
+        s_clearArmedAt = lv_tick_get();
+    } else {
+        s_clearArmed = false;
+        sq->eraseSeq((int8_t)sq->getActiveScene());
+    }
+    sync_ui();
+}
 void halve_cb(lv_event_t*)  { if (auto* sq = seq()) sq->halveScene(sq->getActiveScene()); sync_ui(); }
 
 /* ── an Arrange track's seq ────────────────────────────────────────────────
@@ -765,8 +783,10 @@ void track_bounce_cb(lv_event_t*)
 
 void edit_src_cb(lv_event_t*)
 {
-    if (!in_track()) return;
-    const bool pitch = crosspad::arrangeFocus().source == crosspad::SeqSource::Pitch;
+    /* A track plays what Arrange's "plays with" card said; on its own, this
+     * screen plays its own source -- the kit, or the instrument it borrowed. */
+    const bool pitch = in_track() ? crosspad::arrangeFocus().source == crosspad::SeqSource::Pitch
+                                  : s_src == Src::Inst;
     crosspad_gui::mode_overlay_open_app(pitch ? "PitchPlay" : "Sampler");
 }
 
@@ -1704,7 +1724,7 @@ void scene_menu_close()
     s_sceneMenu = nullptr;
     s_bpm = nullptr;
     s_srcBtn = s_srcLabel = nullptr;
-    s_syncBtn = s_levelsBtn = nullptr;
+    s_syncBtn = s_levelsBtn = s_preBtn = nullptr;
     sync_ui();
 }
 
@@ -1771,6 +1791,8 @@ void scene_menu_cb(lv_event_t*)
     lv_obj_t* scenes = make_row(s_sceneMenu, 28);
     scene_menu_button(scenes, 68, LV_SYMBOL_PLUS "  ADD", scene_add_cb);
     scene_menu_button(scenes, 68, LV_SYMBOL_MINUS "  DEL", scene_del_cb);
+    /* The count-in lives here since the soft keys became the track view's. */
+    s_preBtn = scene_menu_button(scenes, 68, "PRE", pre_cb);
 
     lv_obj_t* srcs = make_row(s_sceneMenu, 28);
     s_srcBtn = scene_menu_button(srcs, 68, "KIT", src_cb);
@@ -1875,38 +1897,31 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
     lv_obj_add_event_cb(s_grid, grid_draw_cb, LV_EVENT_DRAW_MAIN_END, nullptr);
 
     /* ── soft keys ──────────────────────────────────────────────────────
-     * Two rows, because this screen is two things. On its own: M (the click),
-     * PRE (the count-in), x2, /2, BOUNCE, ERASE. As an Arrange track's seq
-     * (the design's seq view): the way back to the arrangement and the way
-     * into its sound take the first two slots, and the rest is the same.
+     * One row, the same whether this screen was opened on its own or as an
+     * Arrange track's seq (the design's seq view): the way to the arrangement,
+     * the way into the sound the notes play through, x2, /2, BOUNCE, ERASE and
+     * CLEAR. On its own, ARR opens Arrange and BOUNCE puts the scene into the
+     * open song; as a track, BOUNCE is asked over the arrangement it changes.
+     * The click is the transport bar's key, the count-in is in the scene
+     * window behind the name.
      *
      * Chosen here, not switched later, because an app is built on every start
      * -- so what Arrange handed over is known by the time this runs. */
-    if (in_track()) {
-        s_arrBtn = make_button(s_root, 52, 28, LV_SYMBOL_LEFT " ARR", arr_back_cb);
-        place(s_arrBtn, 6, SEQ_Y(206));
-        s_editBtn = make_button(s_root, 56, 28, "EDIT " LV_SYMBOL_RIGHT, edit_src_cb);
-        place(s_editBtn, 62, SEQ_Y(206));
-        /* Lime: of the six keys this is the one that leads somewhere new --
-         * the sound the notes play through. */
-        lv_obj_set_style_bg_color(s_editBtn, kAccent, 0);
-        lv_obj_set_style_text_color(lv_obj_get_child(s_editBtn, 0), kInk, 0);
-        place(make_button(s_root, 30, 28, "x2", double_cb), 122, SEQ_Y(206));
-        place(make_button(s_root, 30, 28, "/2", halve_cb), 156, SEQ_Y(206));
-        place(make_button(s_root, 62, 28, "BOUNCE", track_bounce_cb), 190, SEQ_Y(206));
-        s_eraseBtn = make_button(s_root, 58, 28, "ERASE", nullptr);
-        place(s_eraseBtn, 256, SEQ_Y(206));
-    } else {
-        s_clickBtn = make_button(s_root, 34, 28, "M", click_cb);
-        place(s_clickBtn, 6, SEQ_Y(206));
-        s_preBtn = make_button(s_root, 44, 28, "PRE", pre_cb);
-        place(s_preBtn, 44, SEQ_Y(206));
-        place(make_button(s_root, 34, 28, "x2", double_cb), 92, SEQ_Y(206));
-        place(make_button(s_root, 34, 28, "/2", halve_cb), 130, SEQ_Y(206));
-        place(make_button(s_root, 72, 28, "BOUNCE", bounce_cb), 168, SEQ_Y(206));
-        s_eraseBtn = make_button(s_root, 70, 28, "ERASE", nullptr);
-        place(s_eraseBtn, 244, SEQ_Y(206));
-    }
+    s_arrBtn = make_button(s_root, 44, 28, LV_SYMBOL_LEFT " ARR", arr_back_cb);
+    place(s_arrBtn, 6, SEQ_Y(206));
+    s_editBtn = make_button(s_root, 48, 28, "EDIT " LV_SYMBOL_RIGHT, edit_src_cb);
+    place(s_editBtn, 52, SEQ_Y(206));
+    /* Lime: of the keys this is the one that leads somewhere new -- the sound
+     * the notes play through. */
+    lv_obj_set_style_bg_color(s_editBtn, kAccent, 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(s_editBtn, 0), kInk, 0);
+    place(make_button(s_root, 28, 28, "x2", double_cb), 102, SEQ_Y(206));
+    place(make_button(s_root, 28, 28, "/2", halve_cb), 132, SEQ_Y(206));
+    place(make_button(s_root, 54, 28, "BOUNCE", in_track() ? track_bounce_cb : bounce_cb), 162, SEQ_Y(206));
+    s_eraseBtn = make_button(s_root, 48, 28, "ERASE", nullptr);
+    place(s_eraseBtn, 218, SEQ_Y(206));
+    s_clearBtn = make_button(s_root, 46, 28, "CLEAR", clear_cb);
+    place(s_clearBtn, 268, SEQ_Y(206));
     lv_obj_add_event_cb(s_eraseBtn, erase_cb, LV_EVENT_PRESSED, nullptr);
     lv_obj_add_event_cb(s_eraseBtn, erase_cb, LV_EVENT_RELEASED, nullptr);
     lv_obj_add_event_cb(s_eraseBtn, erase_cb, LV_EVENT_PRESS_LOST, nullptr);
@@ -2014,7 +2029,8 @@ void Sequencer_destroy(lv_obj_t* root)
     s_srcClose = nullptr;
     for (auto& c : s_swingChip) c = nullptr;
     s_bouncing = false;
-    s_root = s_grid = s_bpm = s_syncBtn = s_levelsBtn = s_clickBtn = s_preBtn = s_barsLabel = nullptr;
+    s_root = s_grid = s_bpm = s_syncBtn = s_levelsBtn = s_clearBtn = s_preBtn = s_barsLabel = nullptr;
+    s_clearArmed = false;
     s_quantBtn = s_quantLabel = s_sceneLabel = s_eraseBtn = nullptr;
     s_arrBtn = s_editBtn = nullptr;
     s_recBtn = s_dubBtn = s_playBtn = s_stopBtn = nullptr;
