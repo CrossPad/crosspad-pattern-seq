@@ -35,6 +35,7 @@
 #include "crosspad/event/IEventBus.hpp"
 #include "crosspad/instrument/IInstrumentHost.hpp"
 #include "crosspad/music/MusicTheory.hpp"
+#include "crosspad/pad/PadPerformance.hpp"
 #include "crosspad/kit/IKitManager.hpp"
 #include "crosspad/kit/KitInfo.hpp"
 #include "crosspad/pad/IPadLogicHandler.hpp"
@@ -133,6 +134,7 @@ lv_obj_t* s_root = nullptr;
 lv_obj_t* s_grid = nullptr;
 lv_obj_t* s_bpm = nullptr;
 lv_obj_t* s_syncBtn = nullptr;
+lv_obj_t* s_levelsBtn = nullptr;   ///< the scene window's 16 LEVELS
 lv_obj_t* s_clickBtn = nullptr;
 lv_obj_t* s_preBtn = nullptr;
 /* The two keys this screen grows when Arrange sent it: the way back to the
@@ -1008,10 +1010,57 @@ void bounce_progress()
     lv_label_set_text(lv_obj_get_child(s_bounceBtn, 0), "OK");
 }
 
+// ── 16 LEVELS: the Sampler's, from here ────────────────────────────────────
+
+/* So a part can be recorded in it: one pad of the kit at sixteen loudnesses or
+ * sixteen semitones. Off, velocity, pitch, off -- the way the Sampler's own
+ * button goes round, and the same mode: the Sampler's pads are the ones this
+ * screen plays. A take keeps what each hit sounded as (PadPerformance), so the
+ * part plays the same once the mode is off again. Only with the kit as the
+ * source -- an instrument's pads are notes already. */
+crosspad::IPadPerformance* pad_performance()
+{
+    return crosspad::getPlatformServices().padPerformance;
+}
+
+void levels_sync()
+{
+    if (!s_levelsBtn) return;
+    auto* perf = pad_performance();
+    const bool usable = perf && s_src == Src::Kit;
+    const crosspad::PadLevels lv = usable ? perf->levels() : crosspad::PadLevels::Off;
+    char buf[24];
+    switch (lv) {
+        case crosspad::PadLevels::Velocity:
+            std::snprintf(buf, sizeof(buf), "16 VEL  PAD %u", (unsigned)perf->levelsSource() + 1);
+            break;
+        case crosspad::PadLevels::Pitch:
+            std::snprintf(buf, sizeof(buf), "16 PITCH  PAD %u", (unsigned)perf->levelsSource() + 1);
+            break;
+        default:
+            std::snprintf(buf, sizeof(buf), "16 LEVELS");
+            break;
+    }
+    set_text(lv_obj_get_child(s_levelsBtn, 0), buf);
+    paint(s_levelsBtn, lv != crosspad::PadLevels::Off ? kAccent : kPanel, lv != crosspad::PadLevels::Off);
+    lv_obj_set_style_opa(s_levelsBtn, usable ? LV_OPA_COVER : LV_OPA_40, 0);
+}
+
+void levels_cb(lv_event_t*)
+{
+    auto* perf = pad_performance();
+    if (!perf || s_src != Src::Kit) return;
+    using L = crosspad::PadLevels;
+    const L now = perf->levels();
+    perf->setLevels(now == L::Off ? L::Velocity : (now == L::Velocity ? L::Pitch : L::Off));
+    levels_sync();
+}
+
 // ── SRC: the kit, or an instrument borrowed from Pitch Play ────────────────
 
 void src_sync()
 {
+    levels_sync();             // usable only while the pads play the kit
     if (!s_srcLabel) return;
     if (s_src == Src::Kit) { set_text(s_srcLabel, "KIT"); return; }
     if (!s_instReady.load()) { set_text(s_srcLabel, "..."); return; }
@@ -1655,7 +1704,7 @@ void scene_menu_close()
     s_sceneMenu = nullptr;
     s_bpm = nullptr;
     s_srcBtn = s_srcLabel = nullptr;
-    s_syncBtn = nullptr;
+    s_syncBtn = s_levelsBtn = nullptr;
     sync_ui();
 }
 
@@ -1727,6 +1776,7 @@ void scene_menu_cb(lv_event_t*)
     s_srcBtn = scene_menu_button(srcs, 68, "KIT", src_cb);
     s_srcLabel = lv_obj_get_child(s_srcBtn, 0);
     s_syncBtn = scene_menu_button(srcs, 68, "SYNC", sync_cb);
+    s_levelsBtn = scene_menu_button(srcs, 104, "16 LEVELS", levels_cb);
     src_sync();
 
     scene_menu_button(s_sceneMenu, 120, LV_SYMBOL_OK "  Done", scene_menu_close_cb);
@@ -1964,7 +2014,7 @@ void Sequencer_destroy(lv_obj_t* root)
     s_srcClose = nullptr;
     for (auto& c : s_swingChip) c = nullptr;
     s_bouncing = false;
-    s_root = s_grid = s_bpm = s_syncBtn = s_clickBtn = s_preBtn = s_barsLabel = nullptr;
+    s_root = s_grid = s_bpm = s_syncBtn = s_levelsBtn = s_clickBtn = s_preBtn = s_barsLabel = nullptr;
     s_quantBtn = s_quantLabel = s_sceneLabel = s_eraseBtn = nullptr;
     s_arrBtn = s_editBtn = nullptr;
     s_recBtn = s_dubBtn = s_playBtn = s_stopBtn = nullptr;
