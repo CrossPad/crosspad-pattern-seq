@@ -2102,7 +2102,7 @@ void Sequencer_destroy(lv_obj_t* root)
     s_prevEncGroup = nullptr;
 #endif
 
-    lv_obj_delete_async(root);
+    if (root) lv_obj_delete_async(root);
 }
 
 // Auto-registration: the app shows up in the launcher with no wiring anywhere
