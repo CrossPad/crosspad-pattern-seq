@@ -1,7 +1,7 @@
 {
   "name": "Sequencer",
   "id": "sequencer",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Record, loop and erase scenes on the pads",
   "category": "music",
   "icon": "sequencer.png",
@@ -11,10 +11,11 @@
     "pc"
   ],
   "requires": {
-    "crosspad-core": ">=1.58.0",
-    "crosspad-gui": ">=1.13.0"
+    "crosspad-core": "^2.0.0",
+    "crosspad-gui": "^2.0.0"
   },
   "changelog": [
+    "0.9.1: requires crosspad-core 2.0 and crosspad-gui 2.0 (^2.0.0); a root deleted before the app's teardown is handled (gui 2.0 calls destroy with none)",
     "0.9.0: opened from an Arrange track (CLIP EDIT on a seq block, or from MODE on a song with a kit seq track) this screen is one block of it -- the one picked, or the one under Arrange's playhead -- named T<track> B<bar>: its notes are put in the track's scene and looped here on their own, and what is recorded, erased, doubled or cleared goes back to the block as it changes, a block as long as its notes following x2 and /2. On a bar with no block the first notes made become one. Recording against the arrangement is Arrange's REC now, so PLAY here no longer runs the song, and the scene keys do not step away from the block. A block longer than a scene holds (8 bars, 192 notes) is left to Arrange, with a note saying so. Requires core 1.58 (ISongEngine::openSeqEdit).",
     "0.8.1: opened from MODE on a song with a seq track that plays the kit, the screen is that track, as Arrange's EDIT opens it -- REC goes into the scene the track plays and PLAY runs with the song. It recorded into whatever scene was up, and Arrange showed the track empty and silent. A song without such a track keeps the groove sequencer.",
     "0.8.0: one screen, from MODE or from an Arrange track -- the same soft keys either way: ARR, EDIT (the Sampler or Pitch Play, whichever the notes play through), x2, /2, BOUNCE, ERASE and a new CLEAR that takes every note of the scene on show (pressed twice). The click is the transport bar's key; the count-in moved to the scene window (PRE).",
