@@ -39,3 +39,7 @@ To list it in the public registry, add the repo to `external-apps.json` in
 [CrossPad/crosspad-apps](https://github.com/CrossPad/crosspad-apps) and give the
 repo the `crosspad-app` topic. A private repo works fine without that — it just
 stays yours.
+
+## License
+
+GPL-3.0-or-later — see [LICENSE](LICENSE).
