@@ -788,11 +788,8 @@ void adopt_song_track()
     {
         std::lock_guard<std::recursive_mutex> l(se->songMutex());
         auto& song = se->song();
-        int track = -1;
-        for (int t = 0; t < crosspad::AudioSong::kTracks && track < 0; ++t) {
-            const auto& tr = song.tracks[t];
-            if (tr.inUse && tr.kind == crosspad::TrackKind::Seq) track = t;
-        }
+        /* The armed one: what REC in Arrange takes onto, of up to two kits. */
+        const int track = song.armedSeqTrack();
         if (track < 0 || song.tracks[track].source != crosspad::SeqSource::Kit) return;
         auto& t = song.tracks[track];
         /* A scene the sequencer does not have: one of its own again, as
@@ -839,6 +836,20 @@ void track_bounce_cb(lv_event_t*)
 
 void edit_src_cb(lv_event_t*)
 {
+    /* A second kit track's kit is not the Sampler's: it is picked from the
+     * track's menu in Arrange, and the Sampler would edit the other one. */
+    if (in_track()) {
+        auto* se = songs();
+        int route = -1;
+        if (se) {
+            std::lock_guard<std::recursive_mutex> l(se->songMutex());
+            route = se->song().seqRoute(crosspad::arrangeFocus().track);
+        }
+        if (route == 1) {
+            ui_toast_show("Kit 2 plays as it is: change it from the track's menu in Arrange.", 3000, UI_TOAST_INFO);
+            return;
+        }
+    }
     /* A track plays what Arrange's "plays with" card said; on its own, this
      * screen plays its own source -- the kit, or the instrument it borrowed. */
     const bool pitch = in_track() ? crosspad::arrangeFocus().source == crosspad::SeqSource::Pitch
@@ -2102,7 +2113,7 @@ void Sequencer_destroy(lv_obj_t* root)
     s_prevEncGroup = nullptr;
 #endif
 
-    lv_obj_delete_async(root);
+    if (root) lv_obj_delete_async(root);
 }
 
 // Auto-registration: the app shows up in the launcher with no wiring anywhere
