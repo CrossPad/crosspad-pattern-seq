@@ -795,8 +795,12 @@ void adopt_song_track()
         /* A scene the sequencer does not have: one of its own again, as
          * Arrange does before it hands a track over. */
         if (t.scene >= sq->getSceneCount()) {
-            sq->addScene();
-            t.scene = sq->getActiveScene();
+            /* The one added, not the active one: while the transport runs
+             * that is still another track's until the loop ends. */
+            const bool added = sq->addScene();
+            const int scene = song.sceneForNewSeq(sq->getSceneCount(), added);
+            if (scene < 0) return;
+            t.scene = (uint8_t)scene;
             moved = true;
         }
         f.clear();
