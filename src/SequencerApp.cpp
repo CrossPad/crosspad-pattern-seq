@@ -1682,9 +1682,12 @@ void bounce_cb(lv_event_t*)
 #endif
 
     std::string project;
+    int offered = 0;   // the tracks in use and the next free one, never fewer than four
     {
         std::lock_guard<std::recursive_mutex> l(se->songMutex());
         project = se->song().name;
+        offered = std::min(crosspad::AudioSong::kTracks,
+                           std::max(se->song().usedTracks() + 1, crosspad::AudioSong::kTracksV5));
     }
     lv_obj_t* t = lv_label_create(s_bounceBox);
     lv_obj_set_style_text_color(t, kText, 0);
@@ -1694,7 +1697,7 @@ void bounce_cb(lv_event_t*)
                           (unsigned)(sq->getActiveScene() + 1),
                           (unsigned)sq->getSceneBars(sq->getActiveScene()),
                           project.empty() ? "no card" : project.c_str());
-    for (int i = 0; i < crosspad::AudioSong::kTracks; ++i) {
+    for (int i = 0; i < offered; ++i) {
         char label[16];
         lv_snprintf(label, sizeof(label), "Track %d", i + 1);
         bounce_button(s_bounceBox, label, bounce_track_cb, (void*)(intptr_t)i);
