@@ -1623,9 +1623,12 @@ void swing_cb(lv_event_t*)
     if (indev_encoderTop) lv_indev_set_group(indev_encoderTop, s_swingGroup);
 #endif
 
+    /* Whose it is: swing is the scene's own, and in a song the scene is the
+     * track's -- every track has its feel. */
     lv_obj_t* title = lv_label_create(s_swingBox);
     lv_obj_set_style_text_color(title, kText, 0);
-    lv_label_set_text(title, "SWING");
+    if (in_track()) set_text_fmt(title, "SWING  -  track %d", crosspad::arrangeFocus().track + 1);
+    else            set_text_fmt(title, "SWING  -  Seq %u", (unsigned)(sq->getActiveScene() + 1));
 
     s_swingText = lv_label_create(s_swingBox);
     lv_obj_set_style_text_font(s_swingText, &lv_font_montserrat_10, 0);
@@ -1704,12 +1707,21 @@ void bounce_cb(lv_event_t*)
                           (unsigned)(sq->getActiveScene() + 1),
                           (unsigned)sq->getSceneBars(sq->getActiveScene()),
                           project.empty() ? "no card" : project.c_str());
+    /* Two tracks a row: one a row was four to eight rows of 26 px under a
+     * two-line question, and Cancel fell off the 200 px screen. */
+    lv_obj_t* grid = lv_obj_create(s_bounceBox);
+    lv_obj_remove_style_all(grid);
+    lv_obj_set_size(grid, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_row(grid, 4, 0);
+    lv_obj_set_style_pad_column(grid, 4, 0);
+    lv_obj_remove_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
     for (int i = 0; i < offered; ++i) {
         char label[16];
         lv_snprintf(label, sizeof(label), "Track %d", i + 1);
-        bounce_button(s_bounceBox, label, bounce_track_cb, (void*)(intptr_t)i);
+        lv_obj_set_size(bounce_button(grid, label, bounce_track_cb, (void*)(intptr_t)i), LV_PCT(49), 24);
     }
-    bounce_button(s_bounceBox, "Cancel", bounce_close_cb, nullptr);
+    lv_obj_set_height(bounce_button(s_bounceBox, "Cancel", bounce_close_cb, nullptr), 24);
 }
 
 // ── building ───────────────────────────────────────────────────────────────
