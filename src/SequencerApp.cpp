@@ -840,17 +840,24 @@ void track_bounce_cb(lv_event_t*)
 
 void edit_src_cb(lv_event_t*)
 {
-    /* A second kit track's kit is not the Sampler's: it is picked from the
-     * track's menu in Arrange, and the Sampler would edit the other one. */
-    if (in_track()) {
+    /* A kit track's kit is the Sampler's once the kits' engine holds it
+     * (Arrange gives it the engine as CLIP EDIT opens here): before, the
+     * Sampler would edit the track's neighbour's. */
+    if (in_track() && crosspad::arrangeFocus().source == crosspad::SeqSource::Kit) {
         auto* se = songs();
-        int route = -1;
+        std::string kit;
+        bool live = false;
         if (se) {
             std::lock_guard<std::recursive_mutex> l(se->songMutex());
-            route = se->song().seqRoute(crosspad::arrangeFocus().track);
+            const auto& song = se->song();
+            const int t = crosspad::arrangeFocus().track;
+            live = song.liveKit == t;
+            kit = song.seqRoute(t) == 0 ? song.tracks[t].kit : std::string();
         }
-        if (route == 1) {
-            ui_toast_show("Kit 2 plays as it is: change it from the track's menu in Arrange.", 3000, UI_TOAST_INFO);
+        crosspad::IKitManager* km = crosspad::getKitManager();
+        const crosspad::KitInfo* cur = km ? km->getCurrentKit() : nullptr;
+        if (!live || (!kit.empty() && (!cur || cur->path != kit))) {
+            ui_toast_show("The track's kit is still loading -- EDIT again in a moment.", 3000, UI_TOAST_INFO);
             return;
         }
     }
