@@ -1924,7 +1924,10 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
      * fixes every row to a screen y and its two gaps are not equal -- 5 above
      * the grid, 6 below it -- which one pad_row cannot express. SEQ_Y turns a
      * screen y into a root y: the root fills the app container, which begins
-     * under the 30 px transport bar. */
+     * under the transport bar -- 40 px since it grew from the design's 30, so
+     * the rows above the grid sit 10 px lower than the design's and the grid
+     * is 10 px shorter: placed at the design's y the top row was 5 px under
+     * the bar. */
 #define SEQ_Y(v) ((v) - TRANSPORT_BAR_HEIGHT)
     auto place = [](lv_obj_t* o, int32_t x, int32_t y) { if (o) lv_obj_set_pos(o, x, y); return o; };
 
@@ -1932,10 +1935,10 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
      * No back button and no tempo field: back is the power button's click
      * everywhere, and the tempo is in the transport bar (edited in the scene
      * window behind the name). */
-    place(make_button(s_root, 20, 22, LV_SYMBOL_LEFT, scene_prev_cb), 6, SEQ_Y(35));
+    place(make_button(s_root, 20, 22, LV_SYMBOL_LEFT, scene_prev_cb), 6, SEQ_Y(45));
 
     s_sceneBtn = make_button(s_root, 56, 22, "Seq 1/1", scene_menu_cb);
-    place(s_sceneBtn, 26, SEQ_Y(35));
+    place(s_sceneBtn, 26, SEQ_Y(45));
     s_sceneLabel = lv_obj_get_child(s_sceneBtn, 0);
     /* The design sets the name in montserrat 12, which this firmware does not
      * build; 14 is the next one up and 56 px holds "Seq 1/1" in it. Flat,
@@ -1944,22 +1947,22 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
     lv_obj_set_style_text_font(s_sceneLabel, &lv_font_montserrat_14, 0);
     lv_obj_set_style_bg_opa(s_sceneBtn, LV_OPA_TRANSP, 0);
 
-    place(make_button(s_root, 20, 22, LV_SYMBOL_RIGHT, scene_next_cb), 82, SEQ_Y(35));
-    place(make_button(s_root, 22, 22, LV_SYMBOL_MINUS, len_dn_cb), 108, SEQ_Y(35));
-    place(make_button(s_root, 22, 22, LV_SYMBOL_PLUS,  len_up_cb), 134, SEQ_Y(35));
+    place(make_button(s_root, 20, 22, LV_SYMBOL_RIGHT, scene_next_cb), 82, SEQ_Y(45));
+    place(make_button(s_root, 22, 22, LV_SYMBOL_MINUS, len_dn_cb), 108, SEQ_Y(45));
+    place(make_button(s_root, 22, 22, LV_SYMBOL_PLUS,  len_up_cb), 134, SEQ_Y(45));
 
     lv_obj_t* barsBtn = make_button(s_root, 30, 22, "4b", bars_cb);
-    place(barsBtn, 162, SEQ_Y(35));
+    place(barsBtn, 162, SEQ_Y(45));
     s_barsLabel = lv_obj_get_child(barsBtn, 0);
 
     s_quantBtn = make_button(s_root, 36, 22, "1/16", quant_cb);
-    place(s_quantBtn, 196, SEQ_Y(35));
+    place(s_quantBtn, 196, SEQ_Y(45));
     s_quantLabel = lv_obj_get_child(s_quantBtn, 0);
 
     /* 78 px, so the amount is on the key rather than hidden behind it: a feel
      * you cannot see the value of is one you cannot put back. */
     s_swingBtn = make_button(s_root, 78, 22, "SWING", swing_cb);
-    place(s_swingBtn, 236, SEQ_Y(35));
+    place(s_swingBtn, 236, SEQ_Y(45));
 
     if (!s_tempoSub) {
         /* Event-bus task: only remember who drives the tempo; sync_ui() on
@@ -1982,8 +1985,8 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
      * UI lives in. */
     s_grid = lv_obj_create(s_root);
     lv_obj_remove_style_all(s_grid);
-    place(s_grid, 6, SEQ_Y(62));
-    lv_obj_set_size(s_grid, 308, 138);
+    place(s_grid, 6, SEQ_Y(72));
+    lv_obj_set_size(s_grid, 308, 128);
     lv_obj_set_style_bg_color(s_grid, kGridBg, 0);
     lv_obj_set_style_bg_opa(s_grid, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_grid, 4, 0);
