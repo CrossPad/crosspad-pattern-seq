@@ -1,7 +1,7 @@
 {
   "name": "Sequencer",
   "id": "sequencer",
-  "version": "0.11.0",
+  "version": "0.13.1",
   "description": "Record, loop and erase scenes on the pads",
   "category": "music",
   "icon": "sequencer.png",
@@ -11,10 +11,13 @@
     "pc"
   ],
   "requires": {
-    "crosspad-core": ">=2.27.0,<3.0.0",
+    "crosspad-core": ">=2.43.0,<3.0.0",
     "crosspad-gui": ">=2.0.0,<3.0.0"
   },
   "changelog": [
+    "0.13.1: the top row (scenes, length, bars, quantize, SWING) sits under the 40 px transport bar instead of 5 px beneath it, the grid 10 px shorter; the design was drawn for a 30 px bar.",
+    "0.13.0: SWING is the scene's own, so in a song the track's (core 2.43): its window names the track or the Seq it sets, and each track plays and records with its own feel. BOUNCE lists the tracks two a row, so Cancel is on the screen with eight of them. Requires core 2.43.",
+    "0.12.0: EDIT on a kit track's seq view opens the Sampler on that track's kit -- no more \"Kit 2 plays as it is\" -- once the kits' engine holds it (a toast while it loads). Requires core 2.42.",
     "0.10.1: a track whose scene the sequencer lacks gets the scene just added, not the active one (core 2.7, AudioSong::sceneForNewSeq). Requires core 2.7.",
     "0.10.0: opened from MODE, the screen is the song's armed kit track (Arrange's ARM), of up to two; the seq view of a second kit track's block plays that track's kit, and EDIT there says the kit is changed from the track's menu in Arrange instead of opening the Sampler on the other one. Requires core 2.2.",
     "0.9.1: builds on core 1.70+/gui 1.28+ and on core/gui 2.x (>=1.70.0,<3.0.0 and >=1.28.0,<3.0.0) for the merge window; a root deleted before the app's teardown is handled (gui 2.0 calls destroy with none)",

@@ -840,17 +840,24 @@ void track_bounce_cb(lv_event_t*)
 
 void edit_src_cb(lv_event_t*)
 {
-    /* A second kit track's kit is not the Sampler's: it is picked from the
-     * track's menu in Arrange, and the Sampler would edit the other one. */
-    if (in_track()) {
+    /* A kit track's kit is the Sampler's once the kits' engine holds it
+     * (Arrange gives it the engine as CLIP EDIT opens here): before, the
+     * Sampler would edit the track's neighbour's. */
+    if (in_track() && crosspad::arrangeFocus().source == crosspad::SeqSource::Kit) {
         auto* se = songs();
-        int route = -1;
+        std::string kit;
+        bool live = false;
         if (se) {
             std::lock_guard<std::recursive_mutex> l(se->songMutex());
-            route = se->song().seqRoute(crosspad::arrangeFocus().track);
+            const auto& song = se->song();
+            const int t = crosspad::arrangeFocus().track;
+            live = song.liveKit == t;
+            kit = song.seqRoute(t) == 0 ? song.tracks[t].kit : std::string();
         }
-        if (route == 1) {
-            ui_toast_show("Kit 2 plays as it is: change it from the track's menu in Arrange.", 3000, UI_TOAST_INFO);
+        crosspad::IKitManager* km = crosspad::getKitManager();
+        const crosspad::KitInfo* cur = km ? km->getCurrentKit() : nullptr;
+        if (!live || (!kit.empty() && (!cur || cur->path != kit))) {
+            ui_toast_show("The track's kit is still loading -- EDIT again in a moment.", 3000, UI_TOAST_INFO);
             return;
         }
     }
@@ -1616,9 +1623,12 @@ void swing_cb(lv_event_t*)
     if (indev_encoderTop) lv_indev_set_group(indev_encoderTop, s_swingGroup);
 #endif
 
+    /* Whose it is: swing is the scene's own, and in a song the scene is the
+     * track's -- every track has its feel. */
     lv_obj_t* title = lv_label_create(s_swingBox);
     lv_obj_set_style_text_color(title, kText, 0);
-    lv_label_set_text(title, "SWING");
+    if (in_track()) set_text_fmt(title, "SWING  -  track %d", crosspad::arrangeFocus().track + 1);
+    else            set_text_fmt(title, "SWING  -  Seq %u", (unsigned)(sq->getActiveScene() + 1));
 
     s_swingText = lv_label_create(s_swingBox);
     lv_obj_set_style_text_font(s_swingText, &lv_font_montserrat_10, 0);
@@ -1697,12 +1707,21 @@ void bounce_cb(lv_event_t*)
                           (unsigned)(sq->getActiveScene() + 1),
                           (unsigned)sq->getSceneBars(sq->getActiveScene()),
                           project.empty() ? "no card" : project.c_str());
+    /* Two tracks a row: one a row was four to eight rows of 26 px under a
+     * two-line question, and Cancel fell off the 200 px screen. */
+    lv_obj_t* grid = lv_obj_create(s_bounceBox);
+    lv_obj_remove_style_all(grid);
+    lv_obj_set_size(grid, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_row(grid, 4, 0);
+    lv_obj_set_style_pad_column(grid, 4, 0);
+    lv_obj_remove_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
     for (int i = 0; i < offered; ++i) {
         char label[16];
         lv_snprintf(label, sizeof(label), "Track %d", i + 1);
-        bounce_button(s_bounceBox, label, bounce_track_cb, (void*)(intptr_t)i);
+        lv_obj_set_size(bounce_button(grid, label, bounce_track_cb, (void*)(intptr_t)i), LV_PCT(49), 24);
     }
-    bounce_button(s_bounceBox, "Cancel", bounce_close_cb, nullptr);
+    lv_obj_set_height(bounce_button(s_bounceBox, "Cancel", bounce_close_cb, nullptr), 24);
 }
 
 // ── building ───────────────────────────────────────────────────────────────
@@ -1905,7 +1924,10 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
      * fixes every row to a screen y and its two gaps are not equal -- 5 above
      * the grid, 6 below it -- which one pad_row cannot express. SEQ_Y turns a
      * screen y into a root y: the root fills the app container, which begins
-     * under the 30 px transport bar. */
+     * under the transport bar -- 40 px since it grew from the design's 30, so
+     * the rows above the grid sit 10 px lower than the design's and the grid
+     * is 10 px shorter: placed at the design's y the top row was 5 px under
+     * the bar. */
 #define SEQ_Y(v) ((v) - TRANSPORT_BAR_HEIGHT)
     auto place = [](lv_obj_t* o, int32_t x, int32_t y) { if (o) lv_obj_set_pos(o, x, y); return o; };
 
@@ -1913,10 +1935,10 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
      * No back button and no tempo field: back is the power button's click
      * everywhere, and the tempo is in the transport bar (edited in the scene
      * window behind the name). */
-    place(make_button(s_root, 20, 22, LV_SYMBOL_LEFT, scene_prev_cb), 6, SEQ_Y(35));
+    place(make_button(s_root, 20, 22, LV_SYMBOL_LEFT, scene_prev_cb), 6, SEQ_Y(45));
 
     s_sceneBtn = make_button(s_root, 56, 22, "Seq 1/1", scene_menu_cb);
-    place(s_sceneBtn, 26, SEQ_Y(35));
+    place(s_sceneBtn, 26, SEQ_Y(45));
     s_sceneLabel = lv_obj_get_child(s_sceneBtn, 0);
     /* The design sets the name in montserrat 12, which this firmware does not
      * build; 14 is the next one up and 56 px holds "Seq 1/1" in it. Flat,
@@ -1925,22 +1947,22 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
     lv_obj_set_style_text_font(s_sceneLabel, &lv_font_montserrat_14, 0);
     lv_obj_set_style_bg_opa(s_sceneBtn, LV_OPA_TRANSP, 0);
 
-    place(make_button(s_root, 20, 22, LV_SYMBOL_RIGHT, scene_next_cb), 82, SEQ_Y(35));
-    place(make_button(s_root, 22, 22, LV_SYMBOL_MINUS, len_dn_cb), 108, SEQ_Y(35));
-    place(make_button(s_root, 22, 22, LV_SYMBOL_PLUS,  len_up_cb), 134, SEQ_Y(35));
+    place(make_button(s_root, 20, 22, LV_SYMBOL_RIGHT, scene_next_cb), 82, SEQ_Y(45));
+    place(make_button(s_root, 22, 22, LV_SYMBOL_MINUS, len_dn_cb), 108, SEQ_Y(45));
+    place(make_button(s_root, 22, 22, LV_SYMBOL_PLUS,  len_up_cb), 134, SEQ_Y(45));
 
     lv_obj_t* barsBtn = make_button(s_root, 30, 22, "4b", bars_cb);
-    place(barsBtn, 162, SEQ_Y(35));
+    place(barsBtn, 162, SEQ_Y(45));
     s_barsLabel = lv_obj_get_child(barsBtn, 0);
 
     s_quantBtn = make_button(s_root, 36, 22, "1/16", quant_cb);
-    place(s_quantBtn, 196, SEQ_Y(35));
+    place(s_quantBtn, 196, SEQ_Y(45));
     s_quantLabel = lv_obj_get_child(s_quantBtn, 0);
 
     /* 78 px, so the amount is on the key rather than hidden behind it: a feel
      * you cannot see the value of is one you cannot put back. */
     s_swingBtn = make_button(s_root, 78, 22, "SWING", swing_cb);
-    place(s_swingBtn, 236, SEQ_Y(35));
+    place(s_swingBtn, 236, SEQ_Y(45));
 
     if (!s_tempoSub) {
         /* Event-bus task: only remember who drives the tempo; sync_ui() on
@@ -1963,8 +1985,8 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
      * UI lives in. */
     s_grid = lv_obj_create(s_root);
     lv_obj_remove_style_all(s_grid);
-    place(s_grid, 6, SEQ_Y(62));
-    lv_obj_set_size(s_grid, 308, 138);
+    place(s_grid, 6, SEQ_Y(72));
+    lv_obj_set_size(s_grid, 308, 128);
     lv_obj_set_style_bg_color(s_grid, kGridBg, 0);
     lv_obj_set_style_bg_opa(s_grid, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_grid, 4, 0);
