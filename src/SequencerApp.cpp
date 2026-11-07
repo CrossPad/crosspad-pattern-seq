@@ -774,8 +774,8 @@ void open_track_block()
 /// Opened from the MODE map (or anywhere but Arrange) on a song with a seq
 /// track that plays the kit: this screen is that track's block under
 /// Arrange's playhead, as CLIP EDIT would have opened it -- or the block the
-/// first notes make there. On its own it recorded into whatever scene was
-/// up, and Arrange showed the track empty and played nothing (11.10.2026). A
+/// first notes make there. On its own it would record into whatever scene was
+/// up, and Arrange would show the track empty and play nothing. A
 /// song with no such track leaves the groove sequencer.
 void adopt_song_track()
 {
