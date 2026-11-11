@@ -1298,7 +1298,11 @@ void src_close()
 {
     if (!s_srcBox) return;
 #ifdef SEQ_USE_ENCODER
-    if (indev_encoderTop && s_encGroup) lv_indev_set_group(indev_encoderTop, s_encGroup);
+    /* KIT is a row of the scene window, which stays open under the picker:
+     * the encoder goes back to it, not to the screen hidden beneath both --
+     * a blind click there could reach CLEAR. */
+    lv_group_t* back = (s_sceneMenu && s_sceneGroup) ? s_sceneGroup : s_encGroup;
+    if (indev_encoderTop && back) lv_indev_set_group(indev_encoderTop, back);
     lv_group_delete_deferred(s_srcGroup);   // the click that closed it is still being read
     s_srcGroup = nullptr;
 #endif
@@ -2064,7 +2068,16 @@ lv_obj_t* Sequencer_create(lv_obj_t* parent, App* app)
             crosspad::transportClaim(crosspad::sequencerTransport());
             if (s_timer) lv_timer_resume(s_timer);
 #ifdef SEQ_USE_ENCODER
-            if (indev_encoderTop && s_encGroup) lv_indev_set_group(indev_encoderTop, s_encGroup);
+            if (indev_encoderTop) {
+                /* Back to whatever window is on top, if one was left open:
+                 * the screen's group would steer buttons hidden under it. */
+                lv_group_t* g = s_encGroup;
+                if (s_srcBox && s_srcGroup) g = s_srcGroup;
+                else if (s_bounceBox && s_bounceGroup) g = s_bounceGroup;
+                else if (s_swingBox && s_swingGroup) g = s_swingGroup;
+                else if (s_sceneMenu && s_sceneGroup) g = s_sceneGroup;
+                if (g) lv_indev_set_group(indev_encoderTop, g);
+            }
 #endif
         });
         app->setOnHide([](lv_obj_t*) {
@@ -2118,7 +2131,9 @@ void Sequencer_destroy(lv_obj_t* root)
     s_swingBox = s_swingText = s_swingVal = s_swingBtn = nullptr;
     s_sceneMenu = s_sceneBtn = nullptr;
 #ifdef SEQ_USE_ENCODER
-    s_sceneGroup = nullptr;   // died with the tree, like the swing window's
+    /* Set only while the scene window is open; a group does not die with the
+     * tree, so closing the app over the window would leak it. */
+    if (s_sceneGroup) { lv_group_delete(s_sceneGroup); s_sceneGroup = nullptr; }
 #endif
     s_srcBox = s_srcList = s_srcNoteLbl = s_srcOctLbl = s_srcBtn = s_srcLabel = nullptr;
     s_srcChordLbl = nullptr;

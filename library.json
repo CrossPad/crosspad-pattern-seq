@@ -1,6 +1,6 @@
 {
   "name": "crosspad-sequencer",
-  "version": "0.13.1",
+  "version": "0.13.2",
   "license": "GPL-3.0-or-later",
   "description": "Record, loop and erase scenes on the pads",
   "keywords": [
